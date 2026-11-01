@@ -300,9 +300,9 @@ Typical timings for 100k records:
 - Initial synchronization: 4h
 - Subsequent synchronization: 20-30 min
 
-### Real-world example: first full transaction-less run
+### Real-world example: full transaction-less run
 
-Measured on 31 Oct / 1 Nov 2026 — a first full **transaction-less copy** (Force truncate mode, every table copied without a row limit) from a production-sized Tier2 into an older AxDB of the same environment.
+Measured on 31 Oct / 1 Nov 2026 — a full **transaction-less copy** (Force truncate mode, every table copied without a row limit) from a production-sized Tier2 into an older AxDB of the same environment. The run was done twice: first without, then with the index optimization of the STREAM route.
 
 **Environment**
 
@@ -310,46 +310,58 @@ Measured on 31 Oct / 1 Nov 2026 — a first full **transaction-less copy** (Forc
 |---|---|
 | Source | D365FO Tier2, Azure SQL — about 25M released items, 76M rows in INVENTTABLEMODULE |
 | Target | Local dev VM: 32 GB RAM, SQL Server 2019 Developer, AxDB about 200 GB (SIMPLE recovery) |
-| Settings | Records to copy 100,000,000 · Force truncate mode on (first run only) · Auto retry on · 3 parallel workers, raised to 6 after 3.5 h |
-| Scope | Transaction table groups excluded (`TableGroup:` rule, ~8,500 tables) plus 96 explicit log / transaction-like tables · 86 Copy strategy lines, mostly item / product filters on items used on `SALESLINE` · INVENTDIM with `-keep` |
+| Scope | Transaction table groups excluded (`TableGroup:` rule, ~8,500 tables) plus about 100 explicit log / transaction-like tables · ~85 Copy strategy lines, mostly item / product filters on items used on `SALESLINE` · INVENTDIM with `-keep` |
+| Settings | Records to copy 100,000,000 · Force truncate mode on · Auto retry on |
 
 **Result**
 
-| | |
-|---|---|
-| Tables | 1,389 processed: 1,388 copied, 1 excluded afterwards, 0 failed |
-| Rows copied | **114.1 million** — the same tables hold 1.0 billion rows on Tier2, so the item filters and exclusions skipped about 89% |
-| Large tables (STREAM) | 60 tables, 96.1M rows, about 18 GB, read in 200,000-row RecId chunks; 0 connection drops needed a resume |
-| Small tables (in memory) | 1,327 tables, 18.0M rows; 1,202 of them have fewer than 10,000 rows (median 0.1 s per table) |
-| Duration | **5 h 04 min** wall clock (20:31 → 01:35), including about 7 min of interruptions (raising the worker count, and Windows Update restarting SQL Server) |
-| Average throughput | about 6,250 rows/s |
-| Peak memory of the tool | 2.7 GB (6 workers in the in-memory phase); a streamed table needs about 100 MB regardless of size |
+| | First run | **Second run (index optimization)** |
+|---|---|---|
+| Tables | 1,389 (1,388 copied, 1 excluded afterwards) | **1,369 copied, 0 failed** (20 more tables excluded as transactions) |
+| Rows copied | 114.1 million | **109.1 million** |
+| Rows of the same tables on Tier2 | 1.0 billion (item filters and exclusions skipped ~89%) | 1.0 billion (~89% skipped) |
+| Large tables (STREAM) | 60 tables, 96.1M rows, ~18 GB | 56 tables, 91.1M rows, ~17 GB, **396 nonclustered indexes disabled during the load and rebuilt** |
+| Small tables (in memory) | 1,327 tables, 18.0M rows | 1,312 tables, 18.0M rows |
+| Connection drops needing a resume | 0 | 0 |
+| Parallel workers | 3, raised to 6 after 3.5 h | 6 |
+| SQL Server `max server memory` | 4 GB, raised to 12 GB after 20 min | 8 GB |
+| AxDB `DELAYED_DURABILITY` | `FORCED` only for the last ~2.5 h | `FORCED` for the whole run |
+| **Duration** | **5 h 04 min** (incl. ~7 min of interruptions) | **1 h 04 min** |
+| Average throughput | ~6,250 rows/s | **~28,500 rows/s** |
+| Peak memory of the tool | 2.7 GB | 2.3 GB (a streamed table needs ~100 MB regardless of size) |
 
-**Slowest tables**
+The second run is about **4.8× faster** overall. Most of it comes from the index optimization; running with 6 workers and `DELAYED_DURABILITY = FORCED` from the start contributed as well.
 
-| Table | Rows copied | Rows on Tier2 | Time | Nonclustered indexes |
-|---|---:|---:|---:|---:|
-| CustomTable | 17,735,522 | 17,735,522 | 119 min | 4 |
-| DIMENSIONATTRIBUTELEVELVALUE | 10,017,950 | 10,017,950 | 118 min | 5 |
-| REQITEMTABLE (sold items) | 6,880,114 | 9,531,211 | 101 min | 5 |
-| DIMENSIONFOCUSLEDGERDIMENSIONREFERENCE | 9,265,514 | 9,265,514 | 62 min | 2 |
-| HCMWORKERTITLE | 5,919,504 | 5,919,504 | 50 min | 2 |
-| DIMENSIONATTRIBUTEVALUECOMBINATION | 1,993,358 | 1,993,358 | 48 min | 49 |
-| WMSLOCATION | 2,128,268 | 2,128,268 | 45 min | 21 |
-| CUSTTABLE | 416,847 | 416,847 | 43 min | 32 |
-| TAMREBATEGROUPLINK (sold items) | 2,109,525 | 10,469,024 | 21 min | 4 |
-| DIMENSIONATTRIBUTEVALUESET | 270,541 | 270,541 | 18 min | 48 |
+**Slowest tables of the first run, compared**
+
+| Table | Rows copied | Nonclustered indexes | First run | Second run (load + index rebuild) | Faster |
+|---|---:|---:|---:|---:|---:|
+| CustomTable | 17,735,522 | 4 | 119 min | 26.4 min (16.3 + 10.1) | 4.5× |
+| DIMENSIONATTRIBUTELEVELVALUE | 10,017,950 | 5 | 118 min | 20.8 min (15.4 + 5.5) | 5.7× |
+| REQITEMTABLE (sold items) | 6,880,114 | 5 | 101 min | 26.1 min (22.3 + 3.8) | 3.9× |
+| DIMENSIONFOCUSLEDGERDIMENSIONREFERENCE | 9,265,514 | 2 | 62 min | 6.5 min (4.0 + 2.5) | 9.5× |
+| HCMWORKERTITLE | 5,919,504 | 2 | 50 min | 11.4 min (9.9 + 1.4) | 4.4× |
+| DIMENSIONATTRIBUTEVALUECOMBINATION | 1,993,358 | 49 | 48 min | 6.8 min (2.1 + 4.7) | 7.2× |
+| WMSLOCATION | 2,128,268 | 21 | 45 min | 16.2 min (7.0 + 9.1) | 2.8× |
+| CUSTTABLE | 416,847 | 32 | 43 min | 5.0 min (4.0 + 1.0) | 8.5× |
+| DIMENSIONATTRIBUTEVALUEGROUP | 1,935,254 | 4 | 22 min | 2.0 min (1.0 + 1.0) | 10.9× |
+| TAMREBATEGROUPLINK (sold items) | 2,109,525 | 4 | 21 min | 7.2 min (4.7 + 2.6) | 2.8× |
+| DIMENSIONATTRIBUTEVALUESET | 270,541 | 48 | 18 min | 1.6 min (0.4 + 1.2) | 11.0× |
+| INVENTTABLEMODULE (sold items) | 1,257,552 | 5 | 15 min | 15.2 min (14.9 + 0.3) | 1.0× |
+| INVENTTABLE (sold items) | 419,184 | 36 | 12 min | 9.0 min (8.3 + 0.8) | 1.3× |
+
+Tables that copy a whole table gain the most. Tables with a sold-items filter (INVENTTABLE, INVENTTABLEMODULE and the other item tables) gain little: their time goes into evaluating the filter on Tier2, not into the insert.
 
 **What limits the speed: the local disk, not Tier2.**
-- Index maintenance is the biggest factor. Tables with 2 nonclustered indexes streamed at 11,000–14,000 rows/s; CUSTTABLE (32 indexes) managed 162 rows/s, DIMENSIONATTRIBUTEVALUESET (48) 256 rows/s. The next version therefore disables nonclustered indexes during a STREAM load and rebuilds them afterwards (5.7× faster on a 20-index test table).
-- **SQL Server memory:** the run started with `max server memory` = 4 GB, so most inserts waited on page reads (`PAGEIOLATCH`). Raising it to 12 GB on the 32 GB VM helped noticeably.
-- **Log flushes:** every 10,000-row batch commit waited on the transaction log (`WRITELOG`). Setting `ALTER DATABASE AxDB SET DELAYED_DURABILITY = FORCED` for the duration of the copy made the inserts about 4–5× faster. Set it back to `DISABLED` afterwards.
+- **Index maintenance** was the biggest factor in the first run: tables with 2 nonclustered indexes streamed at 11,000–14,000 rows/s, CUSTTABLE (32 indexes) at 162 rows/s, DIMENSIONATTRIBUTEVALUESET (48) at 256 rows/s. STREAM now disables nonclustered indexes during the load and rebuilds them once afterwards — the load alone then ran at about 12,000 rows/s for DIMENSIONATTRIBUTEVALUESET and 16,000 rows/s for DIMENSIONATTRIBUTEVALUECOMBINATION (CUSTTABLE, a very wide table, at 1,700 rows/s instead of 162). Indexes that D365 itself keeps disabled (switched-off configuration keys) are marked as such and left untouched; after the run exactly the same indexes were disabled as before.
+- **SQL Server memory:** with `max server memory` = 4 GB most inserts waited on page reads (`PAGEIOLATCH`). 8–12 GB on a 32 GB VM helps noticeably.
+- **Log flushes:** every 10,000-row batch commit waits on the transaction log (`WRITELOG`). `ALTER DATABASE AxDB SET DELAYED_DURABILITY = FORCED` for the duration of the copy made the inserts about 4–5× faster. Set it back to `DISABLED` afterwards.
 - **Parallel workers:** with streaming, 6 workers are safe on a 32 GB VM. More workers help most with the ~1,300 small tables at the end, much less with the big ones, which compete for the same disk.
 
 **Tips for your own first full run**
-- Exclude what you do not need: log, staging, cache and calculated tables can hold far more rows than the master data (in this run 77 such tables with ~395M rows on Tier2 were excluded).
+- Exclude what you do not need: log, staging, cache and calculated tables can hold far more rows than the master data (here about 100 such tables with roughly 400M rows on Tier2 were excluded).
 - Check large copied tables for item relations; a sold-items filter typically cuts item tables to 2–25% of their rows.
-- Pause Windows Update for the duration of the run — here it restarted SQL Server in the middle of the copy (the tool continued after Process Tables, but the interrupted tables had to be copied again).
+- Pause Windows Update for the duration of the run — in the first run it restarted SQL Server in the middle of the copy (the tool continued after Process Tables, but the interrupted tables had to be copied again).
 - After the first run, turn **Force truncate mode** off: tables with saved values then run incrementally (an incremental pass over the item tables took about 3 minutes instead of 10).
 
 ## Notes
