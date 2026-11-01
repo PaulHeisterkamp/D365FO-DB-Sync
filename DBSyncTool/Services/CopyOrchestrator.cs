@@ -21,6 +21,10 @@ namespace DBSyncTool.Services
         private readonly object _tablesLock = new object();
         private CancellationTokenSource? _cancellationTokenSource;
 
+        // AxDB TableGroup per SQL table name; loaded on demand when a "TableGroup:" line is
+        // used in Tables to Copy / Tables to Exclude, refreshed on every Discover Tables.
+        private Dictionary<string, int>? _tableGroups;
+
         public event EventHandler<List<TableInfo>>? TablesUpdated;
         public event EventHandler<string>? StatusUpdated;
         public event EventHandler? TimestampsUpdated;
@@ -95,6 +99,12 @@ namespace DBSyncTool.Services
                 // Get inclusion patterns early to check for single table optimization
                 var inclusionPatterns = GetPatterns(_config.TablesToInclude);
 
+                // Table groups are re-read on every discovery (the AxDB code may have changed)
+                _tableGroups = null;
+                var inclusionMatcher = await BuildMatcherAsync(_config.TablesToInclude, "Tables to Copy");
+                var exclusionMatcher = await BuildMatcherAsync(
+                    CombineExclusionPatterns(_config.TablesToExclude, _config.SystemExcludedTables), "Tables to Exclude");
+
                 // The three System tables lists (exact names) — only the enabled ones.
                 // These are copied with a full TRUNCATE + insert even if absent from
                 // SQLDICTIONARY. Names are deduplicated across the lists.
@@ -102,7 +112,8 @@ namespace DBSyncTool.Services
 
                 // Optimization: If only one specific table (no wildcard), pass it to discovery queries
                 string? specificTableName = null;
-                if (inclusionPatterns.Count == 1 && !inclusionPatterns[0].Contains("*"))
+                if (inclusionPatterns.Count == 1 && !inclusionPatterns[0].Contains("*") &&
+                    !TablePatternMatcher.IsTableGroupRule(inclusionPatterns[0]))
                 {
                     // Convert to uppercase for SQLDICTIONARY queries (D365 stores table names in uppercase)
                     specificTableName = inclusionPatterns[0].ToUpper();
@@ -130,9 +141,11 @@ namespace DBSyncTool.Services
                     _logger($"Found {axdbNonEmptyTables.Count} non-empty tables in AxDB");
                 }
 
-                // Combine TablesToExclude and SystemExcludedTables
-                var combinedExclusions = CombineExclusionPatterns(_config.TablesToExclude, _config.SystemExcludedTables);
-                var exclusionPatterns = GetPatterns(combinedExclusions);
+                // AxDB row counts: size proxy for SQL-filter estimates of tables already in sync
+                // (see SizeEstimate). One cheap query, only when SQL strategies exist.
+                Dictionary<string, long>? axDbRowCounts = null;
+                if (strategyOverrides.Values.Any(s => s.StrategyType == CopyStrategyType.Sql))
+                    axDbRowCounts = await _axDbService.GetTableRowCountsAsync(cancellationToken);
 
                 var excludedFields = GetExcludedFieldsMap(_config.FieldsToExclude);
 
@@ -148,11 +161,11 @@ namespace DBSyncTool.Services
                         continue;
 
                     // Apply inclusion patterns
-                    if (!MatchesAnyPattern(tableName, inclusionPatterns))
+                    if (!inclusionMatcher.Matches(tableName))
                         continue;
 
                     // Apply exclusion patterns
-                    if (MatchesAnyPattern(tableName, exclusionPatterns))
+                    if (exclusionMatcher.Matches(tableName))
                     {
                         // If ShowExcludedTables is enabled and table has at least 1 record, add it with Excluded status
                         if (_config.ShowExcludedTables && rowCount > 0)
@@ -176,7 +189,7 @@ namespace DBSyncTool.Services
                     var strategy = GetStrategy(tableName, strategyOverrides);
 
                     // Skip empty Tier2 tables unless AxDB has rows (truncate mode only).
-                    // -notruncate tables are never truncated, so there is nothing to do for them.
+                    // -notruncate / -keep tables are never truncated, so there is nothing to do for them.
                     if (rowCount == 0)
                     {
                         if (axdbNonEmptyTables == null || !axdbNonEmptyTables.Contains(tableName))
@@ -186,7 +199,7 @@ namespace DBSyncTool.Services
                         }
                         if (strategy.NoTruncate)
                         {
-                            _logger($"[Truncate] {tableName}: 0 rows in Tier2 but -notruncate — skipped");
+                            _logger($"[Truncate] {tableName}: 0 rows in Tier2 but {(strategy.Keep ? "-keep" : "-notruncate")} — skipped");
                             skipped++;
                             continue;
                         }
@@ -249,12 +262,6 @@ namespace DBSyncTool.Services
                         _ => _config.DefaultRecordCount  // Fallback
                     };
 
-                    // Calculate estimated size in MB using minimum of RecordsToCopy and Tier2RowCount
-                    long recordsForCalculation = Math.Min(recordsToCopy, rowCount);
-                    decimal estimatedSizeMB = bytesPerRow > 0 && recordsForCalculation > 0
-                        ? (decimal)bytesPerRow * recordsForCalculation / 1_000_000m
-                        : 0;
-
                     // Check if optimized mode can be used (SysRowVersion optimization)
                     bool hasSysRowVersion = copyableFields
                         .Any(f => f.Equals("SYSROWVERSION", StringComparison.OrdinalIgnoreCase));
@@ -263,6 +270,11 @@ namespace DBSyncTool.Services
                     byte[]? axdbTs = _timestampManager.GetAxDBTimestamp(tableName);
 
                     bool useOptimizedMode = hasSysRowVersion && tier2Ts != null && axdbTs != null;
+
+                    // SQL filters: unknown size (or AxDB count when in sync) instead of the whole Tier2 table
+                    long? axDbRows = axDbRowCounts != null && axDbRowCounts.TryGetValue(tableName, out var axCount) ? axCount : null;
+                    decimal? sizeEstimate = SizeEstimate.EstimateMB(strategy.StrategyType, strategy.SqlTemplate,
+                        recordsToCopy, rowCount, bytesPerRow, axDbRows, useOptimizedMode, strategy.Keep);
 
                     // Create TableInfo
                     var tableInfo = new TableInfo
@@ -275,11 +287,14 @@ namespace DBSyncTool.Services
                         SqlTemplate = strategy.SqlTemplate,
                         UseTruncate = strategy.UseTruncate || (_config.TruncateAllTables && !strategy.NoTruncate),
                         NoTruncate = strategy.NoTruncate,
+                        KeepExisting = strategy.Keep,
                         Tier2RowCount = rowCount,
                         Tier2SizeGB = sizeGB,
                         BytesPerRow = bytesPerRow,
                         RecordsToCopy = recordsToCopy,
-                        EstimatedSizeMB = estimatedSizeMB,
+                        EstimatedSizeMB = sizeEstimate ?? 0,
+                        EstimatedSizeUnknown = sizeEstimate == null,   // after EstimatedSizeMB (its setter clears the flag)
+                        AxDbRowCount = axDbRows,
                         FetchSql = fetchSql,
                         CopyableFields = copyableFields,
                         Status = TableStatus.Pending,
@@ -305,13 +320,13 @@ namespace DBSyncTool.Services
                     {
                         cancellationToken.ThrowIfCancellationRequested();
 
-                        if (!MatchesAnyPattern(tableName, inclusionPatterns))
+                        if (!inclusionMatcher.Matches(tableName))
                         {
                             _logger($"[System] {tableName}: skipped (does not match Tables to Include)");
                             skipped++;
                             continue;
                         }
-                        if (MatchesAnyPattern(tableName, exclusionPatterns))
+                        if (exclusionMatcher.Matches(tableName))
                         {
                             _logger($"[System] {tableName}: skipped (matched exclusion pattern)");
                             skipped++;
@@ -347,11 +362,18 @@ namespace DBSyncTool.Services
                     }
                 }
 
-                // Calculate total estimated size
-                decimal totalEstimatedMB = _tables.Sum(t => t.EstimatedSizeMB);
+                // Calculate total estimated size (tables with an unknown size - SQL filters - are not in it)
+                decimal totalEstimatedMB;
+                int unknownSize;
+                lock (_tablesLock)
+                {
+                    totalEstimatedMB = _tables.Where(t => t.Status != TableStatus.Excluded).Sum(t => t.EstimatedSizeMB);
+                    unknownSize = _tables.Count(t => t.Status != TableStatus.Excluded && t.EstimatedSizeUnknown);
+                }
+                string unknownNote = unknownSize > 0 ? $" (+{unknownSize} SQL-filtered table(s) of unknown size)" : "";
 
-                _logger($"Prepared {processed} tables, {skipped} skipped, {totalEstimatedMB:F2} MB to copy");
-                OnStatusUpdated($"Prepared {processed} tables, {skipped} skipped, {totalEstimatedMB:F2} MB to copy");
+                _logger($"Prepared {processed} tables, {skipped} skipped, {totalEstimatedMB:F2} MB to copy{unknownNote}");
+                OnStatusUpdated($"Prepared {processed} tables, {skipped} skipped, {totalEstimatedMB:F2} MB to copy{unknownNote}");
                 OnTablesUpdated();
             }
             catch (OperationCanceledException)
@@ -472,7 +494,13 @@ namespace DBSyncTool.Services
                 int failed = 0;
 
                 // Pre-calculate total MB for progress estimation (avoid O(n²) LINQ inside loop)
-                decimal totalMB = pendingTables.Sum(t => t.EstimatedSizeMB);
+                // Each table's estimate is captured now: processing replaces EstimatedSizeMB with
+                // the size actually fetched (e.g. a SQL strategy estimated from the default record
+                // count), so summing the live value on completion could exceed totalMB and turn
+                // the remaining time negative.
+                // (TableInfo has no Equals override, so the key compares by reference)
+                var estimateAtStartMB = pendingTables.ToDictionary(t => t, t => t.EstimatedSizeMB);
+                decimal totalMB = estimateAtStartMB.Values.Sum();
                 long completedMB = 0;  // Use Interlocked for thread-safe updates
 
                 // Use explicit worker pattern with ConcurrentQueue for true N-way parallelism
@@ -492,7 +520,7 @@ namespace DBSyncTool.Services
                         if (table.Status == TableStatus.Inserted)
                         {
                             Interlocked.Increment(ref completed);
-                            Interlocked.Add(ref completedMB, (long)(table.EstimatedSizeMB * 100));
+                            Interlocked.Add(ref completedMB, (long)(estimateAtStartMB[table] * 100));
                         }
                         else
                         {
@@ -513,7 +541,7 @@ namespace DBSyncTool.Services
                         var elapsed = stopwatch.Elapsed;
                         var processedCount = completed + failed;
                         decimal mbProcessed = completedMB / 100m;
-                        decimal mbRemaining = totalMB - mbProcessed;
+                        decimal mbRemaining = Math.Max(0m, totalMB - mbProcessed);
 
                         // Calculate estimated time left based on transfer rate
                         string estimatedTimeStr = "";
@@ -746,12 +774,6 @@ namespace DBSyncTool.Services
                 _ => _config.DefaultRecordCount  // Fallback
             };
 
-            // Calculate estimated size in MB using minimum of RecordsToCopy and Tier2RowCount
-            long recordsForCalculation = Math.Min(recordsToCopy, table.Tier2RowCount);
-            decimal estimatedSizeMB = table.BytesPerRow > 0 && recordsForCalculation > 0
-                ? (decimal)table.BytesPerRow * recordsForCalculation / 1_000_000m
-                : 0;
-
             // Check if optimized mode can be used (from the saved values just loaded)
             bool hasSysRowVersion = table.CopyableFields
                 .Any(f => f.Equals("SYSROWVERSION", StringComparison.OrdinalIgnoreCase));
@@ -765,11 +787,17 @@ namespace DBSyncTool.Services
             // -truncate on the strategy line still forces TRUNCATE.
             bool useTruncate = strategy.UseTruncate || (_config.TruncateAllTables && !strategy.NoTruncate);
 
+            // Same estimate rule as Discover Tables (SQL filters: unknown or AxDB count when in sync);
+            // uses the AxDB row count captured during discovery - no database round-trip
+            decimal? sizeEstimate = SizeEstimate.EstimateMB(strategy.StrategyType, strategy.SqlTemplate,
+                recordsToCopy, table.Tier2RowCount, table.BytesPerRow, table.AxDbRowCount, useOptimizedMode, strategy.Keep);
+
             bool changed = table.StrategyType != strategy.StrategyType ||
                            table.RecIdCount != strategy.RecIdCount ||
                            !string.Equals(table.SqlTemplate, strategy.SqlTemplate, StringComparison.Ordinal) ||
                            table.UseTruncate != useTruncate ||
                            table.NoTruncate != strategy.NoTruncate ||
+                           table.KeepExisting != strategy.Keep ||
                            table.UseOptimizedMode != useOptimizedMode ||
                            table.RecordsToCopy != recordsToCopy ||
                            !string.Equals(table.FetchSql, fetchSql, StringComparison.Ordinal);
@@ -780,8 +808,10 @@ namespace DBSyncTool.Services
             table.SqlTemplate = strategy.SqlTemplate;
             table.UseTruncate = useTruncate;
             table.NoTruncate = strategy.NoTruncate;
+            table.KeepExisting = strategy.Keep;
             table.RecordsToCopy = recordsToCopy;
-            table.EstimatedSizeMB = estimatedSizeMB;
+            table.EstimatedSizeMB = sizeEstimate ?? 0;
+            table.EstimatedSizeUnknown = sizeEstimate == null;   // after EstimatedSizeMB (its setter clears the flag)
             table.FetchSql = fetchSql;
             table.UseOptimizedMode = useOptimizedMode;
             table.StoredTier2Timestamp = tier2Ts;
@@ -807,9 +837,11 @@ namespace DBSyncTool.Services
             // Parse first - an invalid strategy line must fail the run before anything changes
             var strategyOverrides = ParseStrategyOverrides(_config.StrategyOverrides);
 
-            var inclusionPatterns = GetPatterns(_config.TablesToInclude);
-            var exclusionPatterns = GetPatterns(
-                CombineExclusionPatterns(_config.TablesToExclude, _config.SystemExcludedTables));
+            // Table groups are taken from the last Discover Tables (loaded now if the
+            // TableGroup rule was added since)
+            var inclusionMatcher = await BuildMatcherAsync(_config.TablesToInclude, "Tables to Copy");
+            var exclusionMatcher = await BuildMatcherAsync(
+                CombineExclusionPatterns(_config.TablesToExclude, _config.SystemExcludedTables), "Tables to Exclude");
             var systemTableNames = GetEnabledSystemTableNames();
 
             // Saved values may have been cleared or updated since the list was discovered
@@ -835,8 +867,8 @@ namespace DBSyncTool.Services
                 bool isSystem = table.StrategyType == CopyStrategyType.System;
 
                 // Same filters Discover Tables applies, plus the System list toggles
-                bool excluded = !MatchesAnyPattern(table.TableName, inclusionPatterns) ||
-                                MatchesAnyPattern(table.TableName, exclusionPatterns) ||
+                bool excluded = !inclusionMatcher.Matches(table.TableName) ||
+                                exclusionMatcher.Matches(table.TableName) ||
                                 (isSystem && !systemTableNames.Contains(table.TableName));
 
                 if (excluded)
@@ -1687,6 +1719,322 @@ namespace DBSyncTool.Services
         }
 
         /// <summary>
+        /// KEEP route (-keep): fetch the strategy rows - only those changed in Tier2 since the
+        /// saved Tier2 timestamp when possible (KeepModeSql.UsesIncrementalFetch) - and upsert
+        /// them by RecId (AxDbDataService.UpsertKeepExistingAsync). No AxDB row outside the
+        /// fetched set is ever deleted; Tier2 deletions are intentionally not propagated.
+        /// </summary>
+        private async Task ProcessTableKeepModeAsync(TableInfo table, CancellationToken cancellationToken)
+        {
+            try
+            {
+                // STAGE 1: FETCH
+                table.Status = TableStatus.Fetching;
+                table.Error = string.Empty;
+                OnTablesUpdated();
+
+                bool incremental = KeepModeSql.UsesIncrementalFetch(table);
+                _logger($"[{table.TableName}] Route KEEP (-keep): upsert fetched rows, nothing else in AxDB is deleted; fetch: " +
+                        (incremental
+                            ? $"rows changed in Tier2 since {TimestampHelper.ToHexString(table.StoredTier2Timestamp!)}"
+                            : "full strategy"));
+
+                var fetchStopwatch = Stopwatch.StartNew();
+                DataTable data = incremental
+                    ? await _tier2Service.FetchDataByTimestampAsync(
+                        table.TableName,
+                        table.CopyableFields,
+                        table.RecIdCount ?? _config.DefaultRecordCount,
+                        table.StoredTier2Timestamp!,
+                        0,
+                        table.SqlTemplate,
+                        cancellationToken)
+                    : await _tier2Service.FetchDataBySqlAsync(table.TableName, table.FetchSql, cancellationToken);
+                fetchStopwatch.Stop();
+
+                table.CachedData = data;
+                table.RecordsFetched = data.Rows.Count;
+                table.FetchTimeSeconds = (decimal)fetchStopwatch.Elapsed.TotalSeconds;
+                _logger($"Fetched {table.TableName}: {table.RecordsFetched} records in {table.FetchTimeSeconds:F2}s");
+
+                cancellationToken.ThrowIfCancellationRequested();
+
+                // STAGE 2: UPSERT
+                table.Status = TableStatus.Inserting;
+                OnTablesUpdated();
+
+                var upsert = await _axDbService.UpsertKeepExistingAsync(table, cancellationToken);
+
+                table.ComparisonUsed = true;
+                table.UnchangedCount = 0;
+                table.ModifiedCount = upsert.Updated;
+                table.NewInTier2Count = upsert.InsertedNew;
+                table.DeletedFromAxDbCount = 0;
+
+                _logger($"[KEEP] {table.TableName}: fetched {upsert.Fetched}, updated {upsert.Updated}, inserted {upsert.InsertedNew}, " +
+                        $"skipped (conflict with local row) {upsert.SkippedConflicts}; no other AxDB rows deleted");
+
+                // STAGE 3: SAVED VALUES - Tier2 = newest fetched SysRowVersion (old value kept when
+                // nothing was fetched), AxDB = current max, so the next run fetches incrementally
+                string? rowVersionColumn = data.Columns.Cast<DataColumn>()
+                    .Select(c => c.ColumnName)
+                    .FirstOrDefault(c => c.Equals("SYSROWVERSION", StringComparison.OrdinalIgnoreCase));
+                if (rowVersionColumn != null)
+                {
+                    try
+                    {
+                        byte[]? tier2MaxTs = data.AsEnumerable()
+                            .Select(r => r.IsNull(rowVersionColumn) ? null : (byte[])r[rowVersionColumn])
+                            .Where(ts => ts != null)
+                            .Max(new TimestampComparer()) ?? table.StoredTier2Timestamp;
+
+                        using var connection = new SqlConnection(_axDbService.GetConnectionString());
+                        await connection.OpenAsync(cancellationToken);
+                        byte[]? axdbMaxTs = await _axDbService.GetMaxTimestampAsync(table.TableName, connection, null, cancellationToken);
+
+                        if (tier2MaxTs != null && axdbMaxTs != null)
+                        {
+                            _timestampManager.SetTimestamps(table.TableName, tier2MaxTs, axdbMaxTs);
+                            _logger($"[{table.TableName}] Timestamps saved: Tier2={TimestampHelper.ToHexString(tier2MaxTs)}, AxDB={TimestampHelper.ToHexString(axdbMaxTs)}");
+                            _timestampManager.SaveToConfig(_config);
+                            OnTimestampsUpdated();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger($"[{table.TableName}] Warning: Could not save timestamps: {ex.Message}");
+                    }
+                }
+
+                // STAGE 4: CLEANUP MEMORY (on success only)
+                table.CachedData?.Dispose();
+                table.CachedData = null;
+                table.Status = TableStatus.Inserted;
+                table.Error = string.Empty;
+
+                var totalTime = table.FetchTimeSeconds + table.DeleteTimeSeconds + table.InsertTimeSeconds;
+                _logger($"Completed {table.TableName} (KEEP): Total time {totalTime:F2}s (Fetch: {table.FetchTimeSeconds:F2}s, Check+replace: {table.DeleteTimeSeconds:F2}s, Insert: {table.InsertTimeSeconds:F2}s)");
+            }
+            catch (OperationCanceledException)
+            {
+                table.CachedData?.Dispose();
+                table.CachedData = null;
+                table.Status = TableStatus.FetchError;
+                table.Error = "Cancelled";
+                _logger($"Cancelled {table.TableName}");
+                throw;
+            }
+            catch (Exception ex)
+            {
+                table.CachedData?.Dispose();
+                table.CachedData = null;
+                table.Status = table.Status == TableStatus.Fetching ? TableStatus.FetchError : TableStatus.InsertError;
+                table.Error = ex.Message;
+                _logger($"ERROR processing {table.TableName}: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// STREAM route (see StreamModeRules for eligibility): open the Tier2 source, then disable
+        /// triggers → TRUNCATE → SqlBulkCopy straight from the source → enable triggers →
+        /// sequence update (not for System tables). The enabled nonclustered indexes are disabled
+        /// for the load and rebuilt afterwards in every outcome (AxDbDataService.StreamInsertAsync).
+        /// The source is a Tier2ChunkedReader (RecId
+        /// keyset chunks of StreamChunkSql.ChunkSize rows, resumes after transient Tier2
+        /// connection errors without interrupting the AxDB bulk insert) whenever
+        /// StreamChunkSql.Build can chunk the table; otherwise one long reader with the normal
+        /// fetch SQL (no resume), with the reason logged. Rows are never
+        /// collected in a DataTable (CachedData stays null), so memory stays flat whatever the
+        /// table size. A StreamingDataReader in between tracks row count, MIN/MAX(RecId) and
+        /// MAX(SysRowVersion), which replace the values the in-memory routes compute from
+        /// CachedData: saved timestamps (Tier2 = MAX streamed SysRowVersion, AxDB = current
+        /// MAX) or, without SysRowVersion, MaxRecId - exactly as the standard route saves them.
+        /// No transaction (as the in-memory bulk insert): a failure leaves a partial table, and
+        /// the retry starts with the TRUNCATE again.
+        /// </summary>
+        private async Task ProcessTableStreamModeAsync(TableInfo table, string reason, CancellationToken cancellationToken)
+        {
+            bool isSystem = table.StrategyType == CopyStrategyType.System;
+            IDisposable? source = null;
+            Tier2ChunkedReader? chunked = null;
+            Tier2DataService.StreamSource? single = null;
+            StreamingDataReader? tracker = null;
+
+            try
+            {
+                // STAGE 1: OPEN THE TIER2 READER (nothing in AxDB is touched until it is open,
+                // so a broken query never leaves a truncated table behind)
+                ReleaseTableMemory(table);
+                table.Status = TableStatus.Fetching;
+                table.Error = string.Empty;
+                table.ComparisonUsed = false;
+                table.CompareTimeSeconds = 0;
+                OnTablesUpdated();
+
+                _logger($"[{table.TableName}] Route STREAM: {reason}");
+                var plan = StreamChunkSql.Build(table);
+                if (plan.Chunked)
+                {
+                    _logger($"[{table.TableName}] STREAM: TRUNCATE, then Tier2 RecId chunks of {StreamChunkSql.ChunkSize:N0} rows → SqlBulkCopy row by row " +
+                            $"(not loaded into memory; a lost Tier2 connection resumes after the last copied RecId, max {StreamChunkSql.MaxResumeRetries} times)");
+                }
+                else
+                {
+                    _logger($"[{table.TableName}] STREAM: TRUNCATE, then ONE Tier2 reader → SqlBulkCopy row by row (not chunked: {plan.FallbackReason}; " +
+                            "a lost Tier2 connection fails the table)");
+                }
+
+                var openStopwatch = Stopwatch.StartNew();
+                IDataReader sourceReader;
+                if (plan.Chunked)
+                {
+                    chunked = await _tier2Service.OpenChunkedStreamReaderAsync(table.TableName, plan, cancellationToken);
+                    source = chunked;
+                    sourceReader = chunked;
+                }
+                else
+                {
+                    single = await _tier2Service.OpenStreamReaderAsync(table.TableName, table.FetchSql, cancellationToken);
+                    source = single;
+                    sourceReader = single.Reader;
+                }
+                openStopwatch.Stop();
+                tracker = new StreamingDataReader(sourceReader, cancellationToken);
+                _logger($"[{table.TableName}] STREAM: Tier2 reader open in {openStopwatch.Elapsed.TotalSeconds:F2}s" +
+                        (single != null ? $" ({single.Behavior})" : ""));
+
+                // STAGE 2: TRUNCATE + STREAMED BULK INSERT (+ sequence)
+                table.Status = TableStatus.Inserting;
+                OnTablesUpdated();
+
+                var copyStopwatch = Stopwatch.StartNew();
+                var progressTracker = tracker;
+                var load = await _axDbService.StreamInsertAsync(
+                    table,
+                    tracker,
+                    updateSequence: !isSystem,
+                    rowsCopied =>
+                    {
+                        double seconds = copyStopwatch.Elapsed.TotalSeconds;
+                        double mb = progressTracker.ApproxBytes / 1_000_000d;
+                        table.RecordsFetched = (int)Math.Min(rowsCopied, int.MaxValue);
+                        _logger($"[{table.TableName}] STREAM: {rowsCopied:N0} rows copied, ~{mb:N0} MB in {seconds:F0}s " +
+                                $"({(seconds > 0 ? mb / seconds : 0):F1} MB/s)");
+                    },
+                    cancellationToken);
+                copyStopwatch.Stop();
+                if (single != null)
+                    single.Completed = true;
+
+                // Split the bulk copy time: time inside the Tier2 reader counts as Fetch
+                decimal readSeconds = (decimal)tracker.ReadTime.TotalSeconds;
+                table.FetchTimeSeconds = (decimal)openStopwatch.Elapsed.TotalSeconds + readSeconds;
+                table.InsertTimeSeconds = Math.Max(0m, table.InsertTimeSeconds - readSeconds);
+
+                long rows = tracker.RowCount;
+                table.RecordsFetched = (int)Math.Min(rows, int.MaxValue);
+                table.RecordsToCopy = rows;
+                table.MinRecId = tracker.MinRecId ?? 0;
+                if (!isSystem)
+                {
+                    long recordsForCalculation = Math.Min(rows, table.Tier2RowCount);
+                    table.EstimatedSizeMB = table.BytesPerRow > 0 && recordsForCalculation > 0
+                        ? (decimal)table.BytesPerRow * recordsForCalculation / 1_000_000m
+                        : 0;
+                }
+
+                // MB/s over the load itself; TRUNCATE and index disable/rebuild reported separately
+                double totalSeconds = Math.Max(0, copyStopwatch.Elapsed.TotalSeconds - (double)table.DeleteTimeSeconds - load.DisableSeconds - load.RebuildSeconds);
+                double totalMb = tracker.ApproxBytes / 1_000_000d;
+                _logger($"[{table.TableName}] STREAM: {rows:N0} rows, ~{totalMb:N0} MB loaded in {totalSeconds:F2}s " +
+                        $"({(totalSeconds > 0 ? totalMb / totalSeconds : 0):F1} MB/s, {(totalSeconds > 0 ? rows / totalSeconds : 0):N0} rows/s)" +
+                        (chunked != null ? $", {chunked.ChunksOpened:N0} Tier2 chunk queries, {chunked.Resumes} resume(s)" : ", single reader") +
+                        $"; indexes: {load.IndexesDisabled + load.IndexesPreDisabled} disabled during the load, rebuilt in {load.RebuildSeconds:F2}s" +
+                        (load.IndexesKeptForForeignKeys > 0 ? $", {load.IndexesKeptForForeignKeys} kept enabled (FK)" : "") +
+                        (load.IndexesLeftDisabled > 0 ? $", {load.IndexesLeftDisabled} left disabled (D365)" : ""));
+
+                // STAGE 3: SAVED VALUES (same as the standard route; System tables have none)
+                if (!isSystem)
+                {
+                    bool hasSysRowVersion = table.CopyableFields.Any(f => f.Equals("SYSROWVERSION", StringComparison.OrdinalIgnoreCase));
+                    if (hasSysRowVersion)
+                    {
+                        try
+                        {
+                            byte[]? tier2MaxTs = tracker.MaxRowVersion;
+
+                            using var connection = new SqlConnection(_axDbService.GetConnectionString());
+                            await connection.OpenAsync(cancellationToken);
+                            byte[]? axdbMaxTs = await _axDbService.GetMaxTimestampAsync(table.TableName, connection, null, cancellationToken);
+
+                            if (tier2MaxTs != null && axdbMaxTs != null)
+                            {
+                                _timestampManager.SetTimestamps(table.TableName, tier2MaxTs, axdbMaxTs);
+                                _logger($"[{table.TableName}] Timestamps saved: Tier2={TimestampHelper.ToHexString(tier2MaxTs)}, AxDB={TimestampHelper.ToHexString(axdbMaxTs)}");
+                                _timestampManager.SaveToConfig(_config);
+                                OnTimestampsUpdated(); // Trigger auto-save to disk
+                            }
+                        }
+                        catch (Exception ex) when (ex is not OperationCanceledException)
+                        {
+                            _logger($"[{table.TableName}] Warning: Could not save timestamps: {ex.Message}");
+                        }
+                    }
+                    else if (tracker.MaxRecId is long maxRecId && maxRecId > 0)
+                    {
+                        _maxRecIdManager.SetMaxRecId(table.TableName, maxRecId);
+                        _maxRecIdManager.SaveToConfig(_config);
+                        OnMaxRecIdsUpdated();
+                        _logger($"[{table.TableName}] MaxRecId saved for fallback mode optimization: {maxRecId}");
+                    }
+                }
+
+                table.Status = TableStatus.Inserted;
+                table.Error = string.Empty;
+
+                var totalTime = table.FetchTimeSeconds + table.DeleteTimeSeconds + table.InsertTimeSeconds;
+                _logger($"Completed {table.TableName} (STREAM): Total time {totalTime:F2}s (Fetch/Tier2 read: {table.FetchTimeSeconds:F2}s, " +
+                        $"Truncate: {table.DeleteTimeSeconds:F2}s, Insert: {table.InsertTimeSeconds:F2}s)");
+            }
+            catch (Exception ex) when (ex is OperationCanceledException || cancellationToken.IsCancellationRequested)
+            {
+                // SqlBulkCopy / SqlClient can surface a cancel as SqlException or InvalidOperationException
+                table.Status = TableStatus.FetchError;
+                table.Error = "Cancelled";
+                _logger($"Cancelled {table.TableName} (STREAM - the AxDB table may be partially filled; the retry truncates it first)");
+                if (ex is OperationCanceledException)
+                    throw;
+                throw new OperationCanceledException("Cancelled", ex, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                var sourceError = tracker?.SourceException;
+                if (ex is AxDbDataService.IndexRebuildException)
+                {
+                    // An index disabled for the load could not be rebuilt: the message names
+                    // the index and the SQL to fix it
+                    table.Status = TableStatus.InsertError;
+                    table.Error = ex.Message;
+                }
+                else
+                {
+                    table.Status = table.Status == TableStatus.Fetching || sourceError != null
+                        ? TableStatus.FetchError
+                        : TableStatus.InsertError;
+                    table.Error = (sourceError ?? ex).Message;
+                }
+                _logger($"ERROR processing {table.TableName} (STREAM, {table.Status}): {table.Error}" +
+                        (table.Status == TableStatus.InsertError || sourceError != null
+                            ? " - the AxDB table may be partially filled; the retry truncates it first"
+                            : ""));
+            }
+            finally
+            {
+                source?.Dispose();
+            }
+        }
+
+        /// <summary>
         /// Process a single table: fetch → insert → clear memory
         /// </summary>
         private async Task ProcessSingleTableAsync(TableInfo table, CancellationToken cancellationToken)
@@ -1696,10 +2044,33 @@ namespace DBSyncTool.Services
 
             try
             {
+                // STREAM: large tables whose AxDB content ends up exactly the fetched set anyway
+                // (System, TRUNCATE, whole-table RecId copy without saved timestamps) are piped
+                // from the Tier2 reader into SqlBulkCopy instead of being loaded into memory.
+                // StreamModeRules never selects KEEP or optimized-mode tables.
+                bool stream = StreamModeRules.ShouldStream(table, out string streamReason);
+
                 // System tables: always full TRUNCATE + insert, no SQLDICTIONARY/RecId/sequence logic
                 if (table.StrategyType == CopyStrategyType.System)
                 {
-                    await ProcessTableSystemModeAsync(table, cancellationToken);
+                    if (stream)
+                        await ProcessTableStreamModeAsync(table, streamReason, cancellationToken);
+                    else
+                        await ProcessTableSystemModeAsync(table, cancellationToken);
+                    return;
+                }
+
+                // -keep: upsert the fetched rows, never delete/truncate anything else. Own route,
+                // so no smart TRUNCATE, delta comparison or incremental delete can touch the table.
+                if (table.KeepExisting)
+                {
+                    await ProcessTableKeepModeAsync(table, cancellationToken);
+                    return;
+                }
+
+                if (stream)
+                {
+                    await ProcessTableStreamModeAsync(table, streamReason, cancellationToken);
                     return;
                 }
 
@@ -1863,9 +2234,12 @@ namespace DBSyncTool.Services
         private StrategyOverride ParseStrategyLine(string line)
         {
             // Trailing flags: -truncate forces TRUNCATE, -notruncate exempts the table from
-            // "Force truncate mode". Both may be written in any order; combining them is an error.
+            // "Force truncate mode", -keep routes the table to KEEP mode (upsert the fetched rows,
+            // never delete anything else; implies -notruncate). Any order; -truncate cannot be
+            // combined with -notruncate or -keep.
             bool useTruncate = false;
             bool noTruncate = false;
+            bool keep = false;
             string workingLine = line.Trim();
 
             while (true)
@@ -1880,6 +2254,11 @@ namespace DBSyncTool.Services
                     noTruncate = true;
                     workingLine = workingLine.Substring(0, workingLine.Length - " -notruncate".Length).Trim();
                 }
+                else if (workingLine.EndsWith(" -keep", StringComparison.OrdinalIgnoreCase))
+                {
+                    keep = true;
+                    workingLine = workingLine.Substring(0, workingLine.Length - " -keep".Length).Trim();
+                }
                 else
                 {
                     break;
@@ -1888,7 +2267,17 @@ namespace DBSyncTool.Services
 
             if (useTruncate && noTruncate)
                 throw new Exception("Invalid format: -truncate and -notruncate cannot be combined");
+            if (useTruncate && keep)
+                throw new Exception("Invalid format: -truncate and -keep cannot be combined");
 
+            var result = ParseStrategyBody(workingLine, useTruncate, noTruncate || keep);
+            result.Keep = keep;
+            return result;
+        }
+
+        /// <summary>The strategy line without its trailing flags (see ParseStrategyLine).</summary>
+        private StrategyOverride ParseStrategyBody(string workingLine, bool useTruncate, bool noTruncate)
+        {
             // Split by pipe
             var parts = workingLine.Split('|');
 
@@ -2033,29 +2422,46 @@ namespace DBSyncTool.Services
                 .ToList();
         }
 
-        private bool MatchesAnyPattern(string tableName, List<string> patterns)
+        /// <summary>
+        /// Compiles a Tables to Copy / Tables to Exclude list. When it contains a
+        /// "TableGroup:" rule, the table groups are loaded from AxDB TABLEMETADATATABLE
+        /// (once; cached until the next Discover Tables) and the rule is logged with the
+        /// number of tables it covers.
+        /// </summary>
+        private async Task<TablePatternMatcher> BuildMatcherAsync(string patternsText, string listName)
         {
-            if (patterns.Count == 0)
-                return false;
+            var patterns = GetPatterns(patternsText);
+            var groupRules = patterns.Where(TablePatternMatcher.IsTableGroupRule).ToList();
 
-            foreach (var pattern in patterns)
+            if (groupRules.Count == 0)
+                return new TablePatternMatcher(patterns);
+
+            // Validate the rule text before touching the database
+            var groups = new HashSet<int>();
+            foreach (var rule in groupRules)
             {
-                if (MatchesPattern(tableName, pattern))
-                    return true;
+                try
+                {
+                    groups.UnionWith(TablePatternMatcher.ParseTableGroupRule(rule));
+                }
+                catch (Exception ex)
+                {
+                    throw new Exception($"{listName}: {ex.Message}");
+                }
             }
 
-            return false;
-        }
+            _tableGroups ??= await _axDbService.GetTableGroupsAsync();
 
-        private bool MatchesPattern(string tableName, string pattern)
-        {
-            // Convert wildcard pattern to regex
-            string regexPattern = "^" + Regex.Escape(pattern).Replace("\\*", ".*") + "$";
-            return Regex.IsMatch(tableName, regexPattern, RegexOptions.IgnoreCase);
+            int covered = _tableGroups.Values.Count(groups.Contains);
+            _logger($"[TableGroup] {listName}: groups {string.Join(",", groups.OrderBy(g => g))} " +
+                    $"cover {covered} table(s) in AxDB");
+
+            return new TablePatternMatcher(patterns, _tableGroups);
         }
 
         private string FormatTime(int totalSeconds)
         {
+            totalSeconds = Math.Max(0, totalSeconds);  // never show "-3:-14"
             int minutes = totalSeconds / 60;
             int seconds = totalSeconds % 60;
             return $"{minutes}:{seconds:D2}";
@@ -2155,7 +2561,8 @@ namespace DBSyncTool.Services
         public int? RecIdCount { get; set; }      // For RecId strategy or SQL with explicit count
         public string SqlTemplate { get; set; } = string.Empty;  // For SQL strategy (raw template with * and @recordCount)
         public bool UseTruncate { get; set; }
-        public bool NoTruncate { get; set; }     // -notruncate: "Force truncate mode" does not apply to this table
+        public bool NoTruncate { get; set; }     // -notruncate: "Force truncate mode" does not apply to this table (also set by -keep)
+        public bool Keep { get; set; }           // -keep: KEEP route - upsert the fetched rows, never delete/truncate other AxDB rows
     }
 
     // Comparer for SQL Server timestamps

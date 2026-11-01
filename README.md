@@ -126,6 +126,39 @@ WHSINVENTRESERVE|sql: SELECT * FROM WHSINVENTRESERVE WHERE ((HIERARCHYLEVEL = 1 
 
 **Records to Copy:** `100000` (default record count for RecId strategy)
 
+**Transaction-less copy (master data only)**
+
+*What it means:* master data, setup and parameters are refreshed from Tier2, while all **transactions in AxDB stay untouched**. Transaction tables (D365FO table groups Transaction, WorksheetHeader/Line, Worksheet, TransactionHeader/Line, Staging) are excluded, so their AxDB content is neither copied nor deleted.
+
+*Prerequisite:* this only works when your local AxDB has the **same baseline as Tier2, just an older version** — e.g. an earlier restore of the same environment. The kept transactions then still point to item numbers, InventDimIds, RecIds etc. that exist in the refreshed master data. Against an unrelated database (Contoso demo data, another customer or project) the kept transactions would reference master data that does not exist.
+
+*Limits:* item/product master data is reduced to items used on Tier2 `SALESLINE`; items that only your local transactions use (purchase-only, stock-only, BOM components) are not copied. Tables without their own strategy line still follow **Records to copy** — set it high enough to cover the master data tables completely.
+
+To set it up, click **Init transaction-less copy** (Tables to Exclude group). It:
+- adds `TableGroup:Transaction,WorksheetHeader,WorksheetLine,Worksheet,TransactionHeader,TransactionLine,Staging` plus the extra log/journal tables from the `[TransactionLessExclude]` section of `DefaultValues.ini` to **Tables to Exclude**, followed by your own tables from the same section of `CustomValues.ini`. Excluded tables are not copied; their AxDB content is left untouched.
+- `CustomValues.ini` lives next to `DBSyncTool.exe` and is empty in the repository: add your customer-specific tables there (one name or `*` pattern per line under `[TransactionLessExclude]`). It is not included in the release package, so upgrading never overwrites it — create it yourself if it is missing:
+  ```
+  [TransactionLessExclude]
+  MYCOMPANYLOGTABLE
+  MYCOMPANYIMPORT*
+  ```
+- generates a **Copy strategy** line for every item/product table that has rows (found in the AxDB SQLDICTIONARY via its `ITEMID` / `PRODUCT` / `DISTINCTPRODUCT` / `DISTINCTPRODUCTVARIANT` / `PRODUCTMASTER` column, or an InventTable relation such as an `INVENTTABLE` or `INVENTITEMBARCODE` column), limited to items used on `SALESLINE`. Own item tables whose item column has another name can be added in `CustomValues.ini`:
+  ```
+  [TransactionLessItemRelations]
+  MYALTERNATIVEITEMS|ITEM
+  ```
+  (text column = item number, matched per company; integer column = InventTable RecId). Example of a generated line:
+  ```
+  INVENTTABLE|sql: SELECT * FROM INVENTTABLE WHERE (INVENTTABLE.ITEMID = '' OR EXISTS (SELECT 1 FROM SALESLINE sl WHERE sl.ITEMID = INVENTTABLE.ITEMID AND sl.DATAAREAID = INVENTTABLE.DATAAREAID)) AND @sysRowVersionFilter
+  ```
+Existing lines for those tables are replaced, everything else is kept. Nothing is saved until the next Discover Tables — review the result first.
+
+*Getting a consistent database afterwards:* if you would rather have **no** transactions than old ones next to the refreshed master data, click **Copy Truncate TSQL** (next to Copy to Clipboard). It copies a T-SQL script that empties the transaction tables: the same table groups (resolved in the target database via `SQLDICTIONARY` + `TABLEMETADATATABLE`) plus the explicit tables from `[TransactionLessExclude]` in `DefaultValues.ini` and `CustomValues.ini`. Run it yourself in SSMS **against the local AxDB only**:
+- it starts with `@Execute = 0` and only lists the affected tables with their row counts;
+- set `@Execute = 1` to truncate — each table in its own transaction, CDC disabled/re-enabled if the table is tracked, a batched `DELETE` when `TRUNCATE` is not allowed (foreign key / indexed view); errors are printed and the script continues.
+
+Take a backup or snapshot first. The tool itself never runs this script.
+
 ### Step 5: Discover Tables
 
 1. Click **Discover Tables**
@@ -181,17 +214,19 @@ Write-Host "Uploading $BackupFilePath..."
 ## Features
 
 ### Core Functionality
-- **Selective Table Copying**: Use patterns to include/exclude tables (e.g., `CUST*`, `Sys*`)
+- **Selective Table Copying**: Use patterns to include/exclude tables (e.g., `CUST*`, `Sys*`), or whole D365FO table groups (e.g., `TableGroup:Transaction,WorksheetLine`, resolved from the AxDB `TABLEMETADATATABLE`)
+- **Transaction-less Copy**: One button sets up a master-data-only copy, with item/product tables limited to items used on sales lines
 - **Simplified Copy Strategies**:
   - **RecId Strategy**: Copy top N records by RecId DESC (e.g., `CUSTTABLE|5000`)
   - **SQL Strategy**: Custom SQL queries with placeholders (e.g., `CUSTTABLE|sql:SELECT * FROM CUSTTABLE WHERE DATAAREAID='USMF'`)
-  - **Truncate Option**: Force TRUNCATE before insert with `-truncate` flag, or exempt a table from the global **Force truncate mode** with `-notruncate`
+  - **Truncate Option**: Force TRUNCATE before insert with `-truncate` flag, or exempt a table from the global **Force truncate mode** with `-notruncate`; `-keep` only inserts/updates the fetched rows and never deletes anything else in AxDB
 - **SysRowVersion Optimization**: Intelligent change detection for incremental sync
   - **INCREMENTAL Mode**: Only sync changed records when changes < 40% threshold
   - **TRUNCATE Mode**: Full table refresh when changes > 40% threshold
   - **Timestamp Tracking**: Automatic persistence of sync state for future optimizations
 - **Smart Field Mapping**: Automatically maps common fields between source and destination
 - **Parallel Execution**: Configurable parallel workers (1-50) for concurrent table processing
+- **Streaming for Large Tables**: A table with 1,000,000+ rows or 500+ MB to copy whose AxDB content is replaced by the fetched rows anyway (whole-table RecId copy without saved values, `-truncate` / Force truncate mode, System tables) is streamed from Tier2 straight into AxDB (TRUNCATE + SqlBulkCopy from a data reader) instead of being loaded into memory, so memory stays flat even with several parallel workers on multi-GB tables. Tier2 is read in short RecId chunks of 200,000 rows; when Azure drops the connection or kills the session, the copy waits and resumes after the last copied RecId (up to 5 times per table) instead of starting the table over. The AxDB table's nonclustered indexes (except those a foreign key needs) are disabled during the load and rebuilt afterwards — also after an error or Stop; a unique index that finds duplicates is reported with the SQL to fix it. Each index the tool disables is marked with the extended property `DBSyncTool_DisabledForLoad` until it is rebuilt, so an interrupted run is finished by the next one, while indexes that D365 itself keeps disabled (switched-off configuration keys) are never touched. Shown as `STREAM` in the Strategy column and in **Get SQL**. Like every bulk insert it is not transactional: a table that finally fails is left partly filled and is truncated again on retry
 - **Delta Comparison**: Smart comparison using RECVERSION + datetime fields to skip unchanged records
 - **Post-Transfer Actions**: Configurable chain of actions after successful sync:
   - **SQL Scripts**: Run custom SQL commands (e.g., cleanup, index rebuild)
@@ -202,7 +237,7 @@ Write-Host "Uploading $BackupFilePath..."
 
 **Format:**
 ```
-TableName|RecordCount|sql:CustomQuery -truncate|-notruncate
+TableName|RecordCount|sql:CustomQuery -truncate|-notruncate|-keep
 ```
 
 **Examples:**
@@ -213,7 +248,13 @@ INVENTTRANS|sql:SELECT * FROM INVENTTRANS WHERE DATAAREAID='USMF' ORDER BY RecId
 CUSTTRANS|5000|sql:SELECT TOP (@recordCount) * FROM CUSTTRANS WHERE BLOCKED=0 ORDER BY RecId DESC
 VENDTABLE|5000 -truncate     # Force truncate
 INVENTTRANS|50000 -notruncate  # Ignore the "Force truncate mode" checkbox for this table
+INVENTDIM|sql:SELECT * FROM INVENTDIM WHERE INVENTSITEID <> '' AND @sysRowVersionFilter -keep  # Upsert only, keep all other AxDB rows
 ```
+
+**Flags:**
+- `-truncate` - TRUNCATE the AxDB table before inserting
+- `-notruncate` - the global **Force truncate mode** checkbox does not apply to this table (automatic TRUNCATE by threshold still can)
+- `-keep` - KEEP mode: the fetched rows are inserted/updated by RecId and **no other AxDB row is ever deleted or truncated** (rows deleted in Tier2 stay in AxDB). A fetched row whose unique key (e.g. INVENTDIMID) already belongs to a different local row is skipped and logged. With `@sysRowVersionFilter` in the SQL, later runs fetch only the rows changed in Tier2. Implies `-notruncate`; cannot be combined with `-truncate`
 
 **SQL Placeholders:**
 - `*` - Replaced with actual field list (only common fields between Tier2 and AxDB)
@@ -258,6 +299,58 @@ For tables with `SysRowVersion` column:
 Typical timings for 100k records:
 - Initial synchronization: 4h
 - Subsequent synchronization: 20-30 min
+
+### Real-world example: first full transaction-less run
+
+Measured on 31 Oct / 1 Nov 2026 — a first full **transaction-less copy** (Force truncate mode, every table copied without a row limit) from a production-sized Tier2 into an older AxDB of the same environment.
+
+**Environment**
+
+| | |
+|---|---|
+| Source | D365FO Tier2, Azure SQL — about 25M released items, 76M rows in INVENTTABLEMODULE |
+| Target | Local dev VM: 32 GB RAM, SQL Server 2019 Developer, AxDB about 200 GB (SIMPLE recovery) |
+| Settings | Records to copy 100,000,000 · Force truncate mode on (first run only) · Auto retry on · 3 parallel workers, raised to 6 after 3.5 h |
+| Scope | Transaction table groups excluded (`TableGroup:` rule, ~8,500 tables) plus 96 explicit log / transaction-like tables · 86 Copy strategy lines, mostly item / product filters on items used on `SALESLINE` · INVENTDIM with `-keep` |
+
+**Result**
+
+| | |
+|---|---|
+| Tables | 1,389 processed: 1,388 copied, 1 excluded afterwards, 0 failed |
+| Rows copied | **114.1 million** — the same tables hold 1.0 billion rows on Tier2, so the item filters and exclusions skipped about 89% |
+| Large tables (STREAM) | 60 tables, 96.1M rows, about 18 GB, read in 200,000-row RecId chunks; 0 connection drops needed a resume |
+| Small tables (in memory) | 1,327 tables, 18.0M rows; 1,202 of them have fewer than 10,000 rows (median 0.1 s per table) |
+| Duration | **5 h 04 min** wall clock (20:31 → 01:35), including about 7 min of interruptions (raising the worker count, and Windows Update restarting SQL Server) |
+| Average throughput | about 6,250 rows/s |
+| Peak memory of the tool | 2.7 GB (6 workers in the in-memory phase); a streamed table needs about 100 MB regardless of size |
+
+**Slowest tables**
+
+| Table | Rows copied | Rows on Tier2 | Time | Nonclustered indexes |
+|---|---:|---:|---:|---:|
+| CustomTable | 17,735,522 | 17,735,522 | 119 min | 4 |
+| DIMENSIONATTRIBUTELEVELVALUE | 10,017,950 | 10,017,950 | 118 min | 5 |
+| REQITEMTABLE (sold items) | 6,880,114 | 9,531,211 | 101 min | 5 |
+| DIMENSIONFOCUSLEDGERDIMENSIONREFERENCE | 9,265,514 | 9,265,514 | 62 min | 2 |
+| HCMWORKERTITLE | 5,919,504 | 5,919,504 | 50 min | 2 |
+| DIMENSIONATTRIBUTEVALUECOMBINATION | 1,993,358 | 1,993,358 | 48 min | 49 |
+| WMSLOCATION | 2,128,268 | 2,128,268 | 45 min | 21 |
+| CUSTTABLE | 416,847 | 416,847 | 43 min | 32 |
+| TAMREBATEGROUPLINK (sold items) | 2,109,525 | 10,469,024 | 21 min | 4 |
+| DIMENSIONATTRIBUTEVALUESET | 270,541 | 270,541 | 18 min | 48 |
+
+**What limits the speed: the local disk, not Tier2.**
+- Index maintenance is the biggest factor. Tables with 2 nonclustered indexes streamed at 11,000–14,000 rows/s; CUSTTABLE (32 indexes) managed 162 rows/s, DIMENSIONATTRIBUTEVALUESET (48) 256 rows/s. The next version therefore disables nonclustered indexes during a STREAM load and rebuilds them afterwards (5.7× faster on a 20-index test table).
+- **SQL Server memory:** the run started with `max server memory` = 4 GB, so most inserts waited on page reads (`PAGEIOLATCH`). Raising it to 12 GB on the 32 GB VM helped noticeably.
+- **Log flushes:** every 10,000-row batch commit waited on the transaction log (`WRITELOG`). Setting `ALTER DATABASE AxDB SET DELAYED_DURABILITY = FORCED` for the duration of the copy made the inserts about 4–5× faster. Set it back to `DISABLED` afterwards.
+- **Parallel workers:** with streaming, 6 workers are safe on a 32 GB VM. More workers help most with the ~1,300 small tables at the end, much less with the big ones, which compete for the same disk.
+
+**Tips for your own first full run**
+- Exclude what you do not need: log, staging, cache and calculated tables can hold far more rows than the master data (in this run 77 such tables with ~395M rows on Tier2 were excluded).
+- Check large copied tables for item relations; a sold-items filter typically cuts item tables to 2–25% of their rows.
+- Pause Windows Update for the duration of the run — here it restarted SQL Server in the middle of the copy (the tool continued after Process Tables, but the interrupted tables had to be copied again).
+- After the first run, turn **Force truncate mode** off: tables with saved values then run incrementally (an incremental pass over the item tables took about 3 minutes instead of 10).
 
 ## Notes
 

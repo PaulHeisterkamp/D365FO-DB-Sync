@@ -16,6 +16,12 @@ namespace DBSyncTool
         private bool _timestampsUpdatedDuringExecution = false;
         private System.Windows.Forms.Timer _updateTimer;
 
+        // "Auto retry failed": upper bound of automatic Retry Failed runs per user-started
+        // operation. Set by the Stop button so a user stop is never followed by an auto retry
+        // (the auto-stop on first failure cancels the same token, but does not set this flag).
+        private const int MaxAutoRetries = 3;
+        private bool _userStopRequested = false;
+
         // Tables whose Copy strategy changed and whose saved values must stay cleared until
         // the new strategy is actually applied (Discover Tables / Process Selected). Processing
         // an already discovered table list writes timestamps back from the pre-edit strategy,
@@ -343,6 +349,7 @@ namespace DBSyncTool
             txtFieldsToExclude.Text = _currentConfig.FieldsToExclude;
             nudDefaultRecordCount.Value = _currentConfig.DefaultRecordCount;
             chkTruncateAll.Checked = _currentConfig.TruncateAllTables;
+            chkAutoRetryFailed.Checked = _currentConfig.AutoRetryFailed;
             chkExecutePostTransferActions.Checked = _currentConfig.ExecutePostTransferActions;
             txtStrategyOverrides.Text = _currentConfig.StrategyOverrides;
 
@@ -428,6 +435,7 @@ namespace DBSyncTool
             _currentConfig.FieldsToExclude = txtFieldsToExclude.Text;
             _currentConfig.DefaultRecordCount = (int)nudDefaultRecordCount.Value;
             _currentConfig.TruncateAllTables = chkTruncateAll.Checked;
+            _currentConfig.AutoRetryFailed = chkAutoRetryFailed.Checked;
             _currentConfig.ExecutePostTransferActions = chkExecutePostTransferActions.Checked;
             _currentConfig.StrategyOverrides = txtStrategyOverrides.Text;
 
@@ -625,6 +633,7 @@ namespace DBSyncTool
             btnProcessSelected.Enabled = !_isExecuting && hasSelection && _orchestrator != null;
             btnRunAll.Enabled = !_isExecuting;
             btnStop.Enabled = _isExecuting;
+            btnInitTransactionLess.Enabled = !_isExecuting;
 
             // Menu items enabled/disabled state
             saveToolStripMenuItem.Enabled = !_isExecuting;
@@ -897,7 +906,7 @@ namespace DBSyncTool
                         _pendingStrategyClears.Remove(table.TableName);
                     }
                 }
-            });
+            }, autoRetryFailed: true);
         }
 
         private async void BtnRetryFailed_Click(object sender, EventArgs e)
@@ -910,7 +919,7 @@ namespace DBSyncTool
                     SaveConfigurationFromUI();
                     await _orchestrator.RetryFailedAsync();
                 }
-            });
+            }, autoRetryFailed: true);
         }
 
         private async void BtnProcessSelected_Click(object sender, EventArgs e)
@@ -985,11 +994,15 @@ namespace DBSyncTool
 
                 // Discovery inside Run All rebuilt the table list from the current strategy
                 _pendingStrategyClears.Clear();
-            });
+            }, autoRetryFailed: true);
         }
 
         private void BtnStop_Click(object sender, EventArgs e)
         {
+            // Remember that the user stopped: the cancelled tables end as FetchError
+            // ("Cancelled") just like after the auto-stop on first failure, so this flag is
+            // what keeps "Auto retry failed" from restarting the run
+            _userStopRequested = true;
             _orchestrator?.Stop();
             Log("Stop requested by user");
         }
@@ -1614,11 +1627,125 @@ namespace DBSyncTool
             }
         }
 
-        private async Task ExecuteOperationAsync(Func<Task> operation)
+        private HashSet<string> GetFailedTableNames()
+        {
+            var failed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (_orchestrator == null) return failed;
+
+            foreach (var table in _orchestrator.GetTables()
+                         .Where(t => t.Status == TableStatus.FetchError || t.Status == TableStatus.InsertError))
+            {
+                failed.Add(table.TableName);
+            }
+            return failed;
+        }
+
+        private int CountTables(TableStatus status) =>
+            _orchestrator?.GetTables().Count(t => t.Status == status) ?? 0;
+
+        /// <summary>
+        /// "Auto retry failed": re-runs the Process Tables code path
+        /// (CopyOrchestrator.ProcessTablesAsync) while tables are failed. Process Tables re-applies
+        /// the current settings, resets failed tables to Pending and processes them together with
+        /// the tables the auto-stop on first failure never started; Inserted tables are not copied
+        /// again. Bounded by MaxAutoRetries, stops early when an attempt makes no progress (same
+        /// failed tables and no new Inserted table), and never runs after the user pressed Stop.
+        /// Runs on the UI thread inside ExecuteOperationAsync, before its finally block.
+        /// </summary>
+        private async Task AutoRetryFailedTablesAsync()
+        {
+            var failed = GetFailedTableNames();
+            if (failed.Count == 0) return;
+
+            if (_userStopRequested)
+            {
+                Log($"Auto retry skipped: stopped by user ({failed.Count} failed table(s))");
+                return;
+            }
+
+            for (int attempt = 1; attempt <= MaxAutoRetries; attempt++)
+            {
+                var orchestrator = _orchestrator;
+                if (orchestrator == null) return;
+
+                int insertedBefore = CountTables(TableStatus.Inserted);
+                int pendingBefore = CountTables(TableStatus.Pending);
+                Log($"Auto retry {attempt}/{MaxAutoRetries}: {failed.Count} failed table(s) - {string.Join(", ", failed.OrderBy(n => n))}; {pendingBefore} not started - re-running Process Tables");
+
+                // Same check as BtnProcessTables_Click, but logged instead of a blocking dialog
+                var duplicates = GetStrategyDuplicates(txtStrategyOverrides.Text);
+                if (duplicates.Count > 0)
+                {
+                    Log($"Auto retry stopped: duplicate tables in Per-Table Strategy ({string.Join(", ", duplicates)}) - fix them, then press Process Tables");
+                    break;
+                }
+
+                // Apply the current UI settings first, as a Process Tables click does. The
+                // timestamp textboxes are refreshed before that, since SaveConfigurationFromUI
+                // copies them back into the config and the run that just ended may have written
+                // new saved values.
+                RefreshTimestampUI();
+                SaveConfigurationFromUI();
+                await Task.Run(() => orchestrator.ProcessTablesAsync());
+
+                // Same as BtnProcessTables_Click: Process Tables re-applied the current strategy,
+                // so the timestamps just written belong to it - stop re-clearing those tables
+                foreach (var table in orchestrator.GetTables().Where(t => t.Status == TableStatus.Inserted))
+                {
+                    _pendingStrategyClears.Remove(table.TableName);
+                }
+
+                var stillFailed = GetFailedTableNames();
+                int insertedAfter = CountTables(TableStatus.Inserted);
+                if (stillFailed.Count == 0)
+                {
+                    Log($"Auto retry {attempt}/{MaxAutoRetries}: no failed tables left ({insertedAfter - insertedBefore} more table(s) inserted)");
+                    break;
+                }
+
+                if (_userStopRequested)
+                {
+                    Log($"Auto retry stopped by user after attempt {attempt}/{MaxAutoRetries}");
+                    break;
+                }
+
+                if (stillFailed.SetEquals(failed) && insertedAfter <= insertedBefore)
+                {
+                    Log($"Auto retry gave up after attempt {attempt}/{MaxAutoRetries}: no progress (same failed table(s), no new table inserted)");
+                    break;
+                }
+
+                if (attempt == MaxAutoRetries)
+                {
+                    Log($"Auto retry gave up after {MaxAutoRetries} attempts");
+                }
+
+                failed = stillFailed;
+            }
+
+            // Final state after the last attempt (whatever ended the loop)
+            var finalFailed = GetFailedTableNames();
+            int finalPending = CountTables(TableStatus.Pending);
+            if (finalFailed.Count > 0 || finalPending > 0)
+            {
+                string failedText = finalFailed.Count > 0
+                    ? $"{finalFailed.Count} failed ({string.Join(", ", finalFailed.OrderBy(n => n))})"
+                    : "0 failed";
+                Log($"Auto retry finished with unprocessed tables: {failedText}, {finalPending} not started (Pending) - fix the failing table(s) and press Process Tables to continue");
+            }
+        }
+
+        /// <param name="autoRetryFailed">
+        /// True for Process Tables / Run All / Retry Failed: when the "Auto retry failed"
+        /// checkbox is on, failed tables are retried automatically before the operation counts
+        /// as finished (so post-transfer actions in the finally block see the final result).
+        /// </param>
+        private async Task ExecuteOperationAsync(Func<Task> operation, bool autoRetryFailed = false)
         {
             try
             {
                 _isExecuting = true;
+                _userStopRequested = false;
                 _timestampsUpdatedDuringExecution = false;  // Reset flag before execution
 
                 // Save config from UI before every operation
@@ -1629,6 +1756,12 @@ namespace DBSyncTool
                 _updateTimer.Start();
 
                 await Task.Run(operation);
+
+                // Still inside the operation: buttons stay disabled, Stop stays enabled
+                if (autoRetryFailed && chkAutoRetryFailed.Checked)
+                {
+                    await AutoRetryFailedTablesAsync();
+                }
             }
             catch (Exception ex)
             {
@@ -2392,6 +2525,301 @@ namespace DBSyncTool
             catch (Exception ex)
             {
                 Log($"Saved values cleared but config save failed: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// The [TransactionLessExclude] lines: standard tables from DefaultValues.ini (fallback: the
+        /// transaction table group rule), then customer specific ones from CustomValues.ini. Shared
+        /// by "Init transaction-less copy" and "Copy Truncate TSQL" so both use the same table list.
+        /// </summary>
+        private (List<string> All, string? DefaultSection, List<string> CustomLines, string CustomFilePath) LoadTransactionLessExcludeLines()
+        {
+            static List<string> SplitSection(string? content) =>
+                string.IsNullOrWhiteSpace(content)
+                    ? new List<string>()
+                    : content.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                        .Select(l => l.Trim())
+                        .Where(l => l.Length > 0)
+                        .ToList();
+
+            var section = LoadDefaultSection(TransactionLessHelper.ExcludeSection);
+            List<string> all = string.IsNullOrWhiteSpace(section)
+                ? new List<string> { TransactionLessHelper.DefaultTableGroupRule }
+                : SplitSection(section);
+
+            var customFilePath = Helpers.DefaultValuesHelper.GetCustomFilePath();
+            var customLines = SplitSection(File.Exists(customFilePath)
+                ? Helpers.DefaultValuesHelper.ReadSection(customFilePath, TransactionLessHelper.ExcludeSection)
+                : null);
+            all.AddRange(customLines);
+
+            return (all, section, customLines, customFilePath);
+        }
+
+        /// <summary>
+        /// Lines of an ini section from DefaultValues.ini followed by the same section of
+        /// CustomValues.ini (each trimmed, blank lines dropped). Missing files/sections → no lines.
+        /// </summary>
+        private List<string> LoadIniSectionLines(string sectionName)
+        {
+            var lines = new List<string>();
+            foreach (var path in new[] { Helpers.DefaultValuesHelper.GetDefaultFilePath(), Helpers.DefaultValuesHelper.GetCustomFilePath() })
+            {
+                if (!File.Exists(path))
+                    continue;
+                var content = Helpers.DefaultValuesHelper.ReadSection(path, sectionName);
+                if (string.IsNullOrWhiteSpace(content))
+                    continue;
+                lines.AddRange(content.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                    .Select(l => l.Trim())
+                    .Where(l => l.Length > 0));
+            }
+            return lines;
+        }
+
+        /// <summary>
+        /// "Copy Truncate TSQL": copies a script to the clipboard that empties the transaction tables
+        /// of the local AxDB (same table list as Init transaction-less copy). The script is run by the
+        /// user in SSMS and only lists the tables until @Execute is set to 1 - the tool never runs it.
+        /// </summary>
+        private void BtnCopyTruncateSql_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                var (lines, section, customLines, customFilePath) = LoadTransactionLessExcludeLines();
+                var result = TransactionTruncateSqlBuilder.Build(lines, DateTime.Now);
+                Clipboard.SetText(result.Sql);
+
+                string source = (section == null ? "table group rule only (DefaultValues.ini section missing)" : "DefaultValues.ini") +
+                                (File.Exists(customFilePath) ? $" + CustomValues.ini ({customLines.Count} line(s))" : " (no CustomValues.ini)");
+                Log($"[Truncate TSQL] Copied to clipboard: {result.TableGroups.Count} table group(s), " +
+                    $"{result.Names.Count} explicit table(s), {result.Patterns.Count} pattern(s) from {source}");
+
+                MessageBox.Show(
+                    "A T-SQL script that empties the transaction tables was copied to the clipboard.\n\n" +
+                    $"Tables: table groups {string.Join(", ", result.TableGroups)} (resolved in the target database) + " +
+                    $"{result.Names.Count} explicit table(s) and {result.Patterns.Count} pattern(s) from [{TransactionLessHelper.ExcludeSection}].\n\n" +
+                    "Paste it into SSMS and run it against the LOCAL AxDB only.\n" +
+                    "It starts with @Execute = 0 and only lists the tables with their row counts. " +
+                    "Set @Execute = 1 to truncate - take a backup or snapshot first.",
+                    "Copy Truncate TSQL", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                Log($"[Truncate TSQL] ERROR: {ex.Message}");
+                MessageBox.Show($"Could not build the truncate script:\n{ex.Message}", "Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        /// <summary>
+        /// "Init transaction-less copy": adds the transaction table exclusions to Tables to
+        /// Exclude and generates Copy strategy lines that limit item/product tables to the items
+        /// used on SALESLINE. Only the two textboxes change - nothing is saved, so the user can
+        /// review the result; the next Discover Tables / Save picks it up (including the usual
+        /// saved-values prompt for widened strategies).
+        /// </summary>
+        private async void BtnInitTransactionLess_Click(object sender, EventArgs e)
+        {
+            if (_isExecuting)
+            {
+                MessageBox.Show("Cannot initialize while an operation is running.",
+                    "Operation In Progress", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            var (excludeLines, section, customLines, customFilePath) = LoadTransactionLessExcludeLines();
+
+            var confirm = MessageBox.Show(
+                "Initialize a transaction-less copy?\n\n" +
+                "Transaction-less means: master data, setup and parameters are refreshed from Tier2, " +
+                "transactions in AxDB stay untouched. This only works if AxDB has the same baseline as " +
+                "Tier2, just an older version (e.g. an earlier restore of the same environment) - otherwise " +
+                "the kept transactions point to master data that does not exist.\n\n" +
+                "Tables to Exclude: adds the transaction table groups rule and the extra tables from " +
+                $"[{TransactionLessHelper.ExcludeSection}] in DefaultValues.ini and CustomValues.ini " +
+                $"({customLines.Count} custom line(s)). Excluded tables are not copied; " +
+                "their AxDB content is left as it is.\n\n" +
+                "Copy strategy: generates a line for every item/product table (AxDB SQLDICTIONARY) that has rows, " +
+                "limited to items used on SALESLINE, plus an INVENTDIM line (site/warehouse/status dimensions only, " +
+                "-keep: upsert only, other AxDB rows are never deleted). Existing lines for those tables are replaced.\n\n" +
+                "Nothing is saved yet - review the result, then run Discover Tables.",
+                "Init transaction-less copy", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (confirm != DialogResult.Yes)
+                return;
+
+            if (section == null)
+                Log($"[Transaction-less] Section [{TransactionLessHelper.ExcludeSection}] not found in DefaultValues.ini - using only: {TransactionLessHelper.DefaultTableGroupRule}");
+            Log(File.Exists(customFilePath)
+                ? $"[Transaction-less] {customLines.Count} custom exclusion line(s) from {customFilePath}"
+                : $"[Transaction-less] No custom exclusions: {customFilePath} not found (optional - add your own tables " +
+                  $"under [{TransactionLessHelper.ExcludeSection}])");
+
+            var axDbSettings = new ConnectionSettings
+            {
+                ServerDatabase = txtAxDbServerDb.Text,
+                Username = txtAxDbUsername.Text,
+                Password = txtAxDbPassword.Text,
+                CommandTimeout = (int)nudAxDbCmdTimeout.Value
+            };
+            var tier2Settings = new ConnectionSettings
+            {
+                ServerDatabase = txtTier2ServerDb.Text,
+                Username = txtTier2Username.Text,
+                Password = txtTier2Password.Text,
+                ConnectionTimeout = (int)nudTier2ConnTimeout.Value,
+                CommandTimeout = (int)nudTier2CmdTimeout.Value
+            };
+
+            _isExecuting = true;
+            UpdateButtonStates();
+            UseWaitCursor = true;
+
+            try
+            {
+                Log("─────────────────────────────────────────────");
+                Log("Init transaction-less copy...");
+
+                var axDb = new AxDbDataService(axDbSettings, Log);
+                var tableGroups = await axDb.GetTableGroupsAsync();
+
+                // Tables to Exclude after the init (+ System Excluded Tables): generated strategy
+                // lines are skipped for tables that would be excluded anyway
+                string newExcludeText = TransactionLessHelper.MergeExcludeLines(
+                    txtTablesToExclude.Text, excludeLines, out var addedExcludes);
+                var exclusionLines = (newExcludeText + "\n" + txtSystemExcludedTables.Text)
+                    .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                    .Select(l => l.Trim())
+                    .Where(l => l.Length > 0);
+                var exclusion = new TablePatternMatcher(exclusionLines, tableGroups);
+
+                foreach (var rule in excludeLines.Where(TablePatternMatcher.IsTableGroupRule))
+                {
+                    var groups = TablePatternMatcher.ParseTableGroupRule(rule);
+                    Log($"[Transaction-less] {rule} covers {tableGroups.Values.Count(groups.Contains)} table(s) in AxDB");
+                }
+
+                // Only tables that actually hold data get a line. Tier2 is the source of the copy;
+                // fall back to AxDB when Tier2 is not configured or not reachable.
+                HashSet<string> nonEmpty;
+                string rowSource;
+                try
+                {
+                    var tier2 = new Tier2DataService(tier2Settings, Log);
+                    var tier2Tables = await tier2.DiscoverTablesAsync();
+                    nonEmpty = new HashSet<string>(tier2Tables.Select(t => t.TableName), StringComparer.OrdinalIgnoreCase);
+                    rowSource = "Tier2";
+                }
+                catch (Exception ex)
+                {
+                    Log($"[Transaction-less] Tier2 not available ({ex.Message}) - using AxDB row counts instead");
+                    nonEmpty = await axDb.GetNonEmptyTableNamesAsync(CancellationToken.None);
+                    rowSource = "AxDB";
+                }
+
+                // Item relation tables with a non-standard item column ([TransactionLessItemRelations]
+                // in DefaultValues.ini and CustomValues.ini, "TABLE|COLUMN")
+                var itemRelations = TransactionLessHelper.ParseItemRelations(
+                    LoadIniSectionLines(TransactionLessHelper.ItemRelationSection), out var invalidRelations);
+                foreach (var bad in invalidRelations)
+                    Log($"[Transaction-less] WARNING: ignored [{TransactionLessHelper.ItemRelationSection}] line '{bad}' (expected TABLE|COLUMN)");
+                if (itemRelations.Count > 0)
+                    Log($"[Transaction-less] Configured item relations: {string.Join(", ", itemRelations.Select(r => $"{r.Key}.{r.Value}"))}");
+
+                var candidates = await axDb.GetItemTableCandidatesAsync(itemRelations);
+                foreach (var missing in itemRelations.Keys.Where(k => !candidates.Any(c => c.TableName.Equals(k, StringComparison.OrdinalIgnoreCase))))
+                    Log($"[Transaction-less] WARNING: configured item relation table {missing} (column {itemRelations[missing]}) not found in AxDB");
+                var strategyLines = new List<string>();
+                int skippedExcluded = 0, skippedEmpty = 0;
+
+                foreach (var candidate in candidates)
+                {
+                    if (exclusion.Matches(candidate.TableName))
+                    {
+                        skippedExcluded++;
+                        continue;
+                    }
+                    if (!nonEmpty.Contains(candidate.TableName))
+                    {
+                        skippedEmpty++;
+                        continue;
+                    }
+
+                    var line = TransactionLessHelper.BuildStrategyLine(candidate, out var filterDescription, itemRelations);
+                    if (line == null)
+                        continue;
+
+                    strategyLines.Add(line);
+                    Log($"[Transaction-less] {candidate.TableName}: filtered by {filterDescription}");
+                }
+
+                // INVENTDIM: only site / warehouse / status level dimensions (referenced by item
+                // master data), all other dimensions empty. Columns come from the AxDB SQLDICTIONARY.
+                string inventDim = TransactionLessHelper.InventDimTable;
+                if (exclusion.Matches(inventDim))
+                {
+                    skippedExcluded++;
+                    Log($"[Transaction-less] {inventDim}: excluded - no strategy line generated");
+                }
+                else if (!nonEmpty.Contains(inventDim))
+                {
+                    skippedEmpty++;
+                    Log($"[Transaction-less] {inventDim}: no rows in {rowSource} - no strategy line generated");
+                }
+                else
+                {
+                    var inventDimStrategy = TransactionLessHelper.BuildInventDimStrategyLine(
+                        await axDb.GetTableColumnTypesAsync(inventDim));
+                    if (inventDimStrategy.Line == null)
+                    {
+                        Log($"[Transaction-less] {inventDim}: none of {string.Join(", ", TransactionLessHelper.InventDimRequiredColumns)} " +
+                            "found in the AxDB SQLDICTIONARY - no strategy line generated");
+                    }
+                    else
+                    {
+                        strategyLines.Add(inventDimStrategy.Line);
+                        Log($"[Transaction-less] {inventDim}: filtered by any of {string.Join("/", inventDimStrategy.RequiredAnyColumns)} non-empty, " +
+                            $"{inventDimStrategy.EmptyColumns.Count} other dimension(s) empty: " +
+                            string.Join(", ", inventDimStrategy.EmptyColumns.Select(c => $"{c.Column} = {c.EmptyValue}")) +
+                            " (-keep: fetched rows are upserted, no other AxDB INVENTDIM row is deleted)");
+                        Log($"[Transaction-less] {inventDim}: not treated as dimensions: {string.Join(", ", inventDimStrategy.IgnoredColumns)}");
+                        if (inventDimStrategy.UnsupportedColumns.Count > 0)
+                            Log($"[Transaction-less] {inventDim}: WARNING - no empty value known for {string.Join(", ", inventDimStrategy.UnsupportedColumns)}; not filtered");
+                    }
+                }
+
+                string newStrategyText = TransactionLessHelper.MergeStrategyLines(
+                    txtStrategyOverrides.Text, strategyLines, out var addedTables, out var replacedTables);
+
+                txtTablesToExclude.Text = newExcludeText;
+                txtStrategyOverrides.Text = newStrategyText;
+
+                if (replacedTables.Count > 0)
+                    Log($"[Transaction-less] Replaced existing strategy line(s): {string.Join(", ", replacedTables)}");
+
+                string summary =
+                    $"Tables to Exclude: {addedExcludes.Count} line(s) added.\n" +
+                    $"Copy strategy: {addedTables.Count} line(s) added, {replacedTables.Count} replaced " +
+                    $"({strategyLines.Count} item/product/INVENTDIM tables with rows in {rowSource}).\n" +
+                    $"Skipped: {skippedExcluded} excluded table(s), {skippedEmpty} empty table(s).";
+                Log("[Transaction-less] " + summary.Replace("\n", " "));
+                Log("[Transaction-less] Not saved yet - review Tables to Exclude and Copy strategy, then run Discover Tables");
+
+                MessageBox.Show(summary + "\n\nReview the result, then run Discover Tables (this saves the configuration).",
+                    "Init transaction-less copy", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                Log($"[Transaction-less] ERROR: {ex.Message}");
+                MessageBox.Show($"Init transaction-less copy failed:\n{ex.Message}", "Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                UseWaitCursor = false;
+                _isExecuting = false;
+                UpdateButtonStates();
             }
         }
 

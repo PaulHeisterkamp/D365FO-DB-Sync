@@ -59,17 +59,18 @@ namespace DBSyncTool.Helpers
         /// </summary>
         public static string GetStrategyTableName(string line)
         {
-            return StripFlags(line, out _, out _).Split('|')[0].Trim();
+            return StripFlags(line, out _, out _, out _).Split('|')[0].Trim();
         }
 
         /// <summary>
-        /// Removes the trailing -truncate / -notruncate flags from a strategy line, mirroring
-        /// CopyOrchestrator.ParseStrategyLine.
+        /// Removes the trailing -truncate / -notruncate / -keep flags from a strategy line,
+        /// mirroring CopyOrchestrator.ParseStrategyLine.
         /// </summary>
-        private static string StripFlags(string line, out bool useTruncate, out bool noTruncate)
+        private static string StripFlags(string line, out bool useTruncate, out bool noTruncate, out bool keep)
         {
             useTruncate = false;
             noTruncate = false;
+            keep = false;
 
             var l = line.Trim();
             while (true)
@@ -83,6 +84,11 @@ namespace DBSyncTool.Helpers
                 {
                     noTruncate = true;
                     l = l.Substring(0, l.Length - " -notruncate".Length).Trim();
+                }
+                else if (l.EndsWith(" -keep", StringComparison.OrdinalIgnoreCase))
+                {
+                    keep = true;
+                    l = l.Substring(0, l.Length - " -keep".Length).Trim();
                 }
                 else
                 {
@@ -181,8 +187,8 @@ namespace DBSyncTool.Helpers
             if (line == null)
                 return new ParsedStrategy { Valid = true, RecordCount = defaultRecordCount };
 
-            var working = StripFlags(line, out bool useTruncate, out bool noTruncate);
-            if (useTruncate && noTruncate)
+            var working = StripFlags(line, out bool useTruncate, out bool noTruncate, out bool keep);
+            if (useTruncate && (noTruncate || keep))
                 return new ParsedStrategy { Valid = false };
 
             var parts = working.Split('|');

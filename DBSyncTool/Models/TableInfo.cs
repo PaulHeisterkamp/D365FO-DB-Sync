@@ -15,6 +15,7 @@ namespace DBSyncTool.Models
         public string SqlTemplate { get; set; } = string.Empty;  // For SQL strategy
         public bool UseTruncate { get; set; }    // -truncate flag
         public bool NoTruncate { get; set; }     // -notruncate flag: table ignores "Force truncate mode"
+        public bool KeepExisting { get; set; }   // -keep flag: upsert fetched rows, never delete/truncate other AxDB rows (KEEP route)
         public double TruncateThresholdPercent { get; set; }  // From config, used in delta comparison optimization
 
         // Tier2 Info
@@ -22,7 +23,23 @@ namespace DBSyncTool.Models
         public decimal Tier2SizeGB { get; set; }
         public long BytesPerRow { get; set; }
         public long RecordsToCopy { get; set; }
-        public decimal EstimatedSizeMB { get; set; }
+        /// <summary>
+        /// Estimated (before the fetch) or actual (after it) size. Setting it clears
+        /// <see cref="EstimatedSizeUnknown"/>, so every place that stores the fetched size also
+        /// replaces the "?" in the grid. Set EstimatedSizeUnknown AFTER this property.
+        /// </summary>
+        public decimal EstimatedSizeMB
+        {
+            get => _estimatedSizeMB;
+            set { _estimatedSizeMB = value; EstimatedSizeUnknown = false; }
+        }
+        private decimal _estimatedSizeMB;
+
+        /// <summary>True when the size cannot be estimated before the fetch (SQL filter, see SizeEstimate).</summary>
+        public bool EstimatedSizeUnknown { get; set; }
+
+        /// <summary>AxDB row count seen during Discover Tables (proxy for SQL-filter estimates).</summary>
+        public long? AxDbRowCount { get; set; }
         public string FetchSql { get; set; } = string.Empty;
 
         // Field Info
@@ -85,10 +102,16 @@ namespace DBSyncTool.Models
                         break;
                 }
 
-                if (UseTruncate)
+                if (KeepExisting)
+                    parts.Add("KEEP");
+                else if (UseTruncate)
                     parts.Add("TRUNC");
                 else if (NoTruncate)
                     parts.Add("NO-TRUNC");
+
+                // Large table that will be piped Tier2 reader → SqlBulkCopy (STREAM route)
+                if (Helpers.StreamModeRules.ShouldStream(this))
+                    parts.Add("STREAM");
 
                 return string.Join(" ", parts);
             }
@@ -115,7 +138,7 @@ namespace DBSyncTool.Models
         public string CompareTimeDisplay => CompareTimeSeconds.ToString("F2");
         public string TotalTimeDisplay => TotalTimeSeconds.ToString("F2");
         public string Tier2RowCountDisplay => Tier2RowCount.ToString("N0");
-        public string EstimatedSizeMBDisplay => EstimatedSizeMB > 0 ? EstimatedSizeMB.ToString("F2") : "";
+        public string EstimatedSizeMBDisplay => EstimatedSizeUnknown ? "?" : EstimatedSizeMB > 0 ? EstimatedSizeMB.ToString("F2") : "";
         public string UnchangedDisplay => ComparisonUsed ? UnchangedCount.ToString("N0") : "";
         public string ModifiedDisplay => ComparisonUsed ? ModifiedCount.ToString("N0") : "";
         public string NewInTier2Display => ComparisonUsed ? NewInTier2Count.ToString("N0") : "";

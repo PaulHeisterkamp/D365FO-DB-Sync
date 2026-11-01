@@ -31,6 +31,13 @@
     <Content Include="DefaultValues.ini">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
+    <!-- Customer specific values, empty in the repository (fill it locally). Copied to the
+         build output but not published, so a release package never replaces a user's
+         filled copy next to the installed exe. -->
+    <Content Include="CustomValues.ini">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Never</CopyToPublishDirectory>
+    </Content>
   </ItemGroup>
 
 </Project>
