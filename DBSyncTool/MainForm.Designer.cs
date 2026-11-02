@@ -34,7 +34,12 @@ namespace DBSyncTool
                 "Flags:\n" +
                 "  -truncate      Force TRUNCATE instead of delta comparison\n" +
                 "  -notruncate    Ignore the 'Force truncate mode' checkbox for this table\n" +
-                "                 (table keeps the normal mode; cannot be combined with -truncate)\n\n" +
+                "                 (table keeps the normal mode; cannot be combined with -truncate)\n" +
+                "  -keep          KEEP mode: insert/update the fetched rows (by RecId), never delete\n" +
+                "                 or truncate any other AxDB row; rows deleted in Tier2 stay in AxDB.\n" +
+                "                 Rows whose unique key belongs to another local row are skipped (logged).\n" +
+                "                 Later runs fetch only rows changed in Tier2 (SQL with @sysRowVersionFilter).\n" +
+                "                 Implies -notruncate; cannot be combined with -truncate\n\n" +
                 "Examples:\n" +
                 "  CUSTTABLE\n" +
                 "  SALESLINE|10000\n" +
@@ -42,7 +47,8 @@ namespace DBSyncTool
                 "  INVENTTRANS|sql:SELECT * FROM INVENTTRANS WHERE DATAAREAID='USMF'\n" +
                 "  CUSTTRANS|5000|sql:SELECT TOP (@recordCount) * FROM CUSTTRANS WHERE BLOCKED=0\n" +
                 "  VENDTABLE|5000 -truncate\n" +
-                "  INVENTTRANS|50000 -notruncate\n\n" +
+                "  INVENTTRANS|50000 -notruncate\n" +
+                "  INVENTDIM|sql:SELECT * FROM INVENTDIM WHERE INVENTSITEID <> '' AND @sysRowVersionFilter -keep\n\n" +
                 "Examples with optimization:\n" +
                 "  INVENTDIM|50000|sql:SELECT * FROM INVENTDIM WHERE DATAAREAID='1000' AND @sysRowVersionFilter ORDER BY RecId DESC";
 
@@ -104,12 +110,14 @@ namespace DBSyncTool
             lblStrategyOverrides = new Label();
             btnSortStrategies = new Button();
             btnClearSavedForStrategy = new Button();
+            btnInitTransactionLess = new Button();
             txtStrategyOverrides = new TextBox();
 
             grpCol4 = new GroupBox();
             lblDefaultRecordCount = new Label();
             nudDefaultRecordCount = new NumericUpDown();
             chkTruncateAll = new CheckBox();
+            chkAutoRetryFailed = new CheckBox();
             chkExecutePostTransferActions = new CheckBox();
             lblFieldsToExclude = new Label();
             txtFieldsToExclude = new TextBox();
@@ -196,6 +204,7 @@ namespace DBSyncTool
             btnRunAll = new Button();
             btnStop = new Button();
             btnCopyToClipboard = new Button();
+            btnCopyTruncateSql = new Button();
 
             // Status
             lblStatus = new Label();
@@ -347,6 +356,7 @@ namespace DBSyncTool
             tabTables.Controls.Add(btnRunAll);
             tabTables.Controls.Add(btnStop);
             tabTables.Controls.Add(btnCopyToClipboard);
+            tabTables.Controls.Add(btnCopyTruncateSql);
             tabTables.Controls.Add(lblStatus);
             tabTables.Controls.Add(dgvTables);
             tabTables.Controls.Add(lblSummary);
@@ -380,6 +390,7 @@ namespace DBSyncTool
             // Column 2: Tables to Exclude
             grpCol2.Controls.Add(lblTablesToExclude);
             grpCol2.Controls.Add(txtTablesToExclude);
+            grpCol2.Controls.Add(btnInitTransactionLess);
             grpCol2.Location = new Point(355, 10);
             grpCol2.Name = "grpCol2";
             grpCol2.Size = new Size(335, 200);
@@ -395,6 +406,30 @@ namespace DBSyncTool
             txtTablesToExclude.ScrollBars = ScrollBars.Both;
             txtTablesToExclude.WordWrap = false;
             txtTablesToExclude.Size = new Size(315, 145);
+
+            btnInitTransactionLess.Text = "Init transaction-less copy";
+            btnInitTransactionLess.Location = new Point(150, 21);
+            btnInitTransactionLess.Size = new Size(175, 21);
+            btnInitTransactionLess.Name = "btnInitTransactionLess";
+            ToolTip excludeTooltip = new ToolTip();
+            excludeTooltip.SetToolTip(btnInitTransactionLess,
+                "Set up a transaction-less copy: master data, setup and parameters are refreshed from Tier2,\n" +
+                "transactions in AxDB stay untouched.\n" +
+                "Requires that AxDB has the same baseline as Tier2, just an older version\n" +
+                "(e.g. an earlier restore of the same environment).\n\n" +
+                "Tables to Exclude: adds the lines from [TransactionLessExclude] in DefaultValues.ini\n" +
+                "(the TableGroup rule for the transaction table groups plus extra log/journal tables)\n" +
+                "and your own tables from [TransactionLessExclude] in CustomValues.ini (next to the exe).\n" +
+                "Excluded tables are not copied; their AxDB content is left as it is.\n\n" +
+                "Copy strategy: generates one SQL line per item/product table found in the AxDB\n" +
+                "SQLDICTIONARY (ITEMID / PRODUCT columns), limiting it to items used on SALESLINE.\n" +
+                "Existing lines for those tables are replaced, other lines are kept.\n\n" +
+                "Nothing is saved until the next Discover Tables / Save - review the result first.");
+            btnInitTransactionLess.Click += BtnInitTransactionLess_Click;
+            excludeTooltip.SetToolTip(lblTablesToExclude,
+                "One pattern per line: exact name, wildcard (Sys*, *Staging) or a table group rule:\n" +
+                "TableGroup:Transaction,WorksheetHeader,WorksheetLine,Worksheet,TransactionHeader,TransactionLine,Staging\n" +
+                "(D365FO TableGroup names or numbers, resolved from the AxDB TABLEMETADATATABLE).");
 
             // Column 3: Copy strategy
             grpCol3.Controls.Add(lblStrategyOverrides);
@@ -443,10 +478,11 @@ namespace DBSyncTool
             grpCol4.Controls.Add(lblDefaultRecordCount);
             grpCol4.Controls.Add(nudDefaultRecordCount);
             grpCol4.Controls.Add(chkTruncateAll);
+            grpCol4.Controls.Add(chkAutoRetryFailed);
             grpCol4.Controls.Add(chkExecutePostTransferActions);
             grpCol4.Location = new Point(1045, 10);
             grpCol4.Name = "grpCol4";
-            grpCol4.Size = new Size(335, 125);
+            grpCol4.Size = new Size(335, 150);
             grpCol4.Text = "Other Settings";
 
             lblDefaultRecordCount.AutoSize = true;
@@ -454,7 +490,8 @@ namespace DBSyncTool
             lblDefaultRecordCount.Text = "Records to copy:";
 
             nudDefaultRecordCount.Location = new Point(140, 23);
-            nudDefaultRecordCount.Maximum = 10000000;
+            // High enough to copy whole tables (largest D365FO tables exceed 10M rows); TOP (n) accepts any int
+            nudDefaultRecordCount.Maximum = 2000000000;
             nudDefaultRecordCount.Minimum = 1;
             nudDefaultRecordCount.Name = "nudDefaultRecordCount";
             nudDefaultRecordCount.Size = new Size(100, 23);
@@ -468,8 +505,22 @@ namespace DBSyncTool
             ToolTip truncateTooltip = new ToolTip();
             truncateTooltip.SetToolTip(chkTruncateAll, "When checked, truncates all target tables before inserting data. Use this for the first run of this tool or when Source database was restored");
 
+            chkAutoRetryFailed.AutoSize = true;
+            chkAutoRetryFailed.Location = new Point(10, 80);
+            chkAutoRetryFailed.Name = "chkAutoRetryFailed";
+            chkAutoRetryFailed.Text = "Auto retry failed";
+            chkAutoRetryFailed.Checked = false;
+            ToolTip autoRetryTooltip = new ToolTip();
+            autoRetryTooltip.SetToolTip(chkAutoRetryFailed,
+                "When checked and Process Tables / Run All / Retry Failed ends with failed tables\n" +
+                "(incl. tables cancelled by the auto-stop on first failure), Process Tables is re-run\n" +
+                "automatically: failed and not-yet-started tables are processed with the current settings,\n" +
+                "already inserted tables are not copied again.\n" +
+                $"At most {MaxAutoRetries} automatic retries; stops early when a retry makes no progress.\n" +
+                "Not used after Stop, Discover Tables or Process Selected.");
+
             chkExecutePostTransferActions.AutoSize = true;
-            chkExecutePostTransferActions.Location = new Point(10, 80);
+            chkExecutePostTransferActions.Location = new Point(10, 105);
             chkExecutePostTransferActions.Name = "chkExecutePostTransferActions";
             chkExecutePostTransferActions.Text = "Execute Post-Transfer Actions";
             chkExecutePostTransferActions.Checked = false;
@@ -1130,6 +1181,21 @@ namespace DBSyncTool
             btnCopyToClipboard.Text = "Copy to Clipboard";
             btnCopyToClipboard.Click += BtnCopyToClipboard_Click;
 
+            // Copy Truncate TSQL Button (transaction-less copy: empty the AxDB transaction tables)
+            btnCopyTruncateSql.Location = new Point(892, 220);
+            btnCopyTruncateSql.Name = "btnCopyTruncateSql";
+            btnCopyTruncateSql.Size = new Size(150, 30);
+            btnCopyTruncateSql.Text = "Copy Truncate TSQL";
+            ToolTip truncateSqlTooltip = new ToolTip();
+            truncateSqlTooltip.SetToolTip(btnCopyTruncateSql,
+                "Copies a T-SQL script to the clipboard that empties the transaction tables of the LOCAL AxDB,\n" +
+                "so that after a transaction-less copy AxDB is consistent again (master data from Tier2, no transactions).\n\n" +
+                "Tables: the TableGroup rule + explicit tables from [TransactionLessExclude] in\n" +
+                "DefaultValues.ini and CustomValues.ini (same list as Init transaction-less copy).\n\n" +
+                "Run it yourself in SSMS against AxDB. It starts with @Execute = 0 (list only);\n" +
+                "set @Execute = 1 to truncate. The tool never runs it.");
+            btnCopyTruncateSql.Click += BtnCopyTruncateSql_Click;
+
             // Status Label (in Tables tab)
             lblStatus.AutoSize = true;
             lblStatus.Location = new Point(12, 260);
@@ -1293,12 +1359,14 @@ namespace DBSyncTool
         private Label lblStrategyOverrides;
         private Button btnSortStrategies;
         private Button btnClearSavedForStrategy;
+        private Button btnInitTransactionLess;
         private TextBox txtStrategyOverrides;
 
         private GroupBox grpCol4;
         private Label lblDefaultRecordCount;
         private NumericUpDown nudDefaultRecordCount;
         private CheckBox chkTruncateAll;
+        private CheckBox chkAutoRetryFailed;
         private CheckBox chkExecutePostTransferActions;
         private Label lblFieldsToExclude;
         private TextBox txtFieldsToExclude;
@@ -1387,6 +1455,7 @@ namespace DBSyncTool
         private Button btnRunAll;
         private Button btnStop;
         private Button btnCopyToClipboard;
+        private Button btnCopyTruncateSql;
 
         // Status and Grid
         private Label lblStatus;

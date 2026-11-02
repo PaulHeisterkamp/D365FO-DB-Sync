@@ -191,6 +191,7 @@ By default, the system matches the last X records between AxDB and Tier2. For so
 - Subsequent runs use INCREMENTAL mode optimization (much faster)
 - Use **Get SQL** (right-click menu) to preview operations before execution
 - Tables are processed in parallel (default: 10 workers, configurable)
+- **Auto retry failed** (Other Settings) re-runs **Process Tables** automatically after a failure (failed + not-yet-started tables) — see [Auto Retry Failed](#auto-retry-failed)
 
 ## Architecture
 
@@ -206,12 +207,14 @@ By default, the system matches the last X records between AxDB and Tier2. For so
 - Handles all interactions with D365FO Azure SQL Database
 - Discovers tables, fetches data, queries SQLDICTIONARY
 - Implements SQLDICTIONARY caching for 10-20x speedup
+- `OpenStreamReaderAsync`: open reader for the [STREAM route](#stream-mode-large-tables) instead of a filled DataTable
 
 **AxDbDataService** (`Services/AxDbDataService.cs`)
 - Handles all interactions with local SQL Server (AxDB)
 - Implements context-aware cleanup strategies
 - Manages triggers, sequences, and bulk inserts via SqlBulkCopy
 - Uses transactions with rollback on errors
+- `StreamInsertAsync`: TRUNCATE + SqlBulkCopy straight from a reader for the [STREAM route](#stream-mode-large-tables)
 
 **PowerShellService** (`Services/PowerShellService.cs`)
 - Runs user-specified .ps1 scripts in-process via `Microsoft.PowerShell.SDK`
@@ -227,7 +230,7 @@ By default, the system matches the last X records between AxDB and Tier2. For so
 ### Data Flow (Two Stages)
 
 1. **Discover Tables**: Discovers tables from Tier2, applies inclusion/exclusion patterns, validates schemas against AxDB, generates fetch SQL for each table
-2. **Process Tables**: Re-applies the current settings to the discovered list (see [Re-applying Settings on Process Tables](#re-applying-settings-on-process-tables)), then parallel workers process tables atomically (each worker: fetch → insert → clear memory → next table). Default: 10 parallel workers, configurable 1-50. Memory cleared immediately after successful insert, retained only for failed tables to enable retry.
+2. **Process Tables**: Re-applies the current settings to the discovered list (see [Re-applying Settings on Process Tables](#re-applying-settings-on-process-tables)), then parallel workers process tables atomically (each worker: fetch → insert → clear memory → next table). Default: 10 parallel workers, configurable 1-50. Memory cleared immediately after successful insert, retained only for failed tables to enable retry. Large tables whose AxDB content ends up exactly the fetched set are not loaded at all — see [STREAM Mode](#stream-mode-large-tables).
 
 ### Copy Strategy System
 
@@ -239,7 +242,7 @@ The tool supports three strategy types defined in `Models/TableInfo.cs`:
 
 **Strategy Syntax:**
 ```
-TableName|RecordCount|sql:CustomQuery -truncate|-notruncate
+TableName|RecordCount|sql:CustomQuery -truncate|-notruncate|-keep
 ```
 
 **Examples:**
@@ -249,6 +252,7 @@ TableName|RecordCount|sql:CustomQuery -truncate|-notruncate
 - `CUSTTRANS|5000|sql:SELECT TOP (@recordCount) * FROM CUSTTRANS WHERE BLOCKED=0` - SQL with count
 - `VENDTABLE|5000 -truncate` - Force truncate mode
 - `INVENTTRANS|50000 -notruncate` - Exempt from the global **Force truncate mode** checkbox
+- `INVENTDIM|sql:SELECT * FROM INVENTDIM WHERE INVENTSITEID <> '' AND @sysRowVersionFilter -keep` - KEEP mode: upsert the fetched rows, never delete other AxDB rows
 
 **SQL Placeholders:**
 - `*` - Replaced with actual field list (only common fields between Tier2 and AxDB)
@@ -259,26 +263,93 @@ TableName|RecordCount|sql:CustomQuery -truncate|-notruncate
   - User must manually add this placeholder to their SQL query WHERE clause
   - Example: `INVENTDIM|50000|sql:SELECT * FROM INVENTDIM WHERE DATAAREAID='1000' AND @sysRowVersionFilter ORDER BY RecId DESC`
 
-**Flags** (trailing, any order, both are case-insensitive):
+**Flags** (trailing, any order, all case-insensitive):
 
 - `-truncate` — force TRUNCATE mode before insert for this table.
 - `-notruncate` — the global **Force truncate mode** checkbox does not apply to this table: it is processed exactly as if the checkbox were off. Used to truncate-copy everything *except* a few tables. It does **not** disable the automatic TRUNCATE that normal mode picks when the change percentage or the AxDB excess exceeds `TruncateThresholdPercent` — that decision is made per run from live data.
-- Combining `-truncate` and `-notruncate` on one line is a parse error.
-- Parsed in `CopyOrchestrator.ParseStrategyLine` into `StrategyOverride.UseTruncate` / `NoTruncate`; the effective value is `TableInfo.UseTruncate = strategy.UseTruncate || (TruncateAllTables && !strategy.NoTruncate)`, computed in Discover Tables and in `ApplyStrategyToTable`. Shown in the grid's **Strategy** column as `TRUNC` / `NO-TRUNC`.
-- With **Force truncate mode** on, discovery also picks up tables that are empty in Tier2 but non-empty in AxDB (so they get truncated); a `-notruncate` table is skipped there instead, since it would have nothing to copy and must not be truncated.
+- `-keep` — **KEEP mode**: the fetched rows are inserted/updated by RecId and **no other AxDB row is ever deleted or truncated**; rows deleted in Tier2 stay in AxDB. For tables whose AxDB content is larger than the copied subset and must survive (e.g. INVENTDIM referenced by kept transaction tables). Implies `-notruncate` (`-keep -notruncate` is allowed, redundant). See [KEEP Mode](#keep-mode--keep).
+- Combining `-truncate` with `-notruncate` or `-keep` on one line is a parse error.
+- Parsed in `CopyOrchestrator.ParseStrategyLine` into `StrategyOverride.UseTruncate` / `NoTruncate` / `Keep` (`-keep` also sets `NoTruncate`); the effective value is `TableInfo.UseTruncate = strategy.UseTruncate || (TruncateAllTables && !strategy.NoTruncate)` and `TableInfo.KeepExisting = strategy.Keep`, computed in Discover Tables and in `ApplyStrategyToTable`. `SavedValuesHelper.StripFlags` mirrors the flag parsing. Shown in the grid's **Strategy** column as `KEEP` / `TRUNC` / `NO-TRUNC`, plus `STREAM` when the table will take the [STREAM route](#stream-mode-large-tables).
+- With **Force truncate mode** on, discovery also picks up tables that are empty in Tier2 but non-empty in AxDB (so they get truncated); a `-notruncate` / `-keep` table is skipped there instead, since it would have nothing to copy and must not be truncated.
+
+### KEEP Mode (-keep)
+
+Own route in `CopyOrchestrator.ProcessSingleTableAsync`, checked right after System and **before** STREAM / UseTruncate / optimized / standard, so smart TRUNCATE detection, delta comparison, the threshold switch and the incremental deletes never run for the table. `ProcessTableKeepModeAsync` → `AxDbDataService.UpsertKeepExistingAsync`; all SQL text comes from `Helpers/KeepModeSql.cs` (shared with Get SQL).
+
+1. **Fetch**: `KeepModeSql.UsesIncrementalFetch` (SQL strategy with `@sysRowVersionFilter` + `SYSROWVERSION` column + saved Tier2 timestamp) → only rows changed in Tier2 since then (`FetchDataByTimestampAsync`, `@Threshold` = saved Tier2 timestamp, `@MinRecId` = 0; `>=`, so the row at the saved timestamp is re-fetched every run). Otherwise the full strategy (`FetchSql`: `@sysRowVersionFilter` → `(1 = 1)`, RecId strategy → TOP N). 0 rows → AxDB not touched.
+2. **Upsert, one transaction**: disable triggers → `SELECT TOP (0) <cols> INTO #keep FROM [T]` (columns = fetched minus rowversion/computed columns from `sys.columns`, i.e. no `SYSROWVERSION`) → SqlBulkCopy into `#keep` → clustered index on `#keep(RECID)`.
+3. **Unique key conflicts**: for every enabled, unfiltered unique index of the AxDB table whose key does not contain RECID (`sys.indexes`), `#keep` rows whose key belongs to a *different* AxDB row that stays (its RecId is not in `#keep`) are removed and logged as "skipped: conflicts with local row" (count per index + first 20 RecId/key pairs). Repeated until a pass removes nothing (max 10). A key moving from a replaced row to a new row is therefore not a conflict.
+4. `DELETE t FROM [T] t WHERE EXISTS (SELECT 1 FROM #keep k WHERE k.RECID = t.RECID)` (= updated rows) → `INSERT INTO [T] (<cols>) SELECT <cols> FROM #keep` → drop `#keep` → enable triggers → `UpdateSequenceAsync` → COMMIT. Rollback + trigger re-enable on error.
+5. **Saved values**: Tier2 = max SysRowVersion of the fetched rows (old value kept when nothing was fetched), AxDB = current max. Tier2 deletions are intentionally never propagated. Log: route, fetch kind, fetched / updated / inserted / skipped-conflict counts; grid Modified/New columns show updated/inserted.
+- Updated rows are rewritten even when unchanged (no RECVERSION comparison). The transaction holds the trigger-disable schema lock on the table while it runs, like INCREMENTAL mode.
+
+### STREAM Mode (large tables)
+
+The in-memory routes load the whole fetch into a DataTable (`TableInfo.CachedData`, roughly 2.4x the Tier2 size) before inserting it, which ran a 32 GB VM out of memory with 3 workers on 3–5 GB tables. The STREAM route copies such tables **without materializing them**: TRUNCATE the AxDB table, then pipe the rows from a Tier2 `SqlDataReader` directly into `SqlBulkCopy.WriteToServerAsync(IDataReader)`. Memory stays flat (measured: 2M rows / 1.5 GB table, peak working set 3,461 MB in-memory vs 67 MB streamed, and faster: 66 s vs 113 s).
+
+**Eligibility** — `Helpers/StreamModeRules.ShouldStream(TableInfo)` (pure; the runtime, Get SQL and the grid's Strategy column all call it), only where the final AxDB content is exactly the fetched set anyway, so the result is identical to the in-memory route:
+- `-keep` → never (it must keep the other AxDB rows)
+- **System** table → yes (TRUNCATE + whole table)
+- `UseTruncate` (`-truncate` or **Force truncate mode**) → yes, any strategy (TRUNCATE + full fetch); also when saved timestamps exist, since UseTruncate skips the optimized mode
+- optimized mode (both saved timestamps present) → never (INCREMENTAL only loads RecId + SysRowVersion control data)
+- **RecId strategy copying the whole table** (`RecordsToCopy >= Tier2RowCount`) without saved timestamps → yes: the standard route ends with AxDB = fetched set (TRUNCATE, or delta incl. `DELETE … RecId < MinRecId`). A saved MaxRecId does not matter (it only marks rows unchanged in the delta comparison)
+- everything else (newest-N RecId copies of a larger table, SQL strategies without `-truncate`) → never
+- and in every "yes" case only when the expected data is large: **`MinRowsToStream` = 1,000,000 rows or `MinSizeMBToStream` = 500 MB**. Expected rows = `MIN(RecordsToCopy, Tier2RowCount)` for RecId, `Tier2RowCount` for SQL/System (a custom query can return the whole table); expected MB = `BytesPerRow` × expected rows / 1e6 (same measure as **Est Size(MB)**: reserved pages incl. indexes). Smaller tables keep the in-memory route.
+
+**Routing** (`CopyOrchestrator.ProcessSingleTableAsync`): System (large → STREAM, else System mode) → KEEP → **STREAM** → UseTruncate → optimized → standard.
+
+**Flow** (`ProcessTableStreamModeAsync` → `Tier2DataService.OpenChunkedStreamReaderAsync` (`Tier2ChunkedReader`) or, when not chunkable, `OpenStreamReaderAsync` + `AxDbDataService.StreamInsertAsync`):
+1. Open the Tier2 source — normally **chunked** (see below), otherwise one long reader with the normal `FetchSql`. `CommandBehavior.SequentialAccess`, Tier2 `CommandTimeout` per query (per network read, like `DataAdapter.Fill`), cancellation token → `SqlCommand.Cancel`. The first query runs **before** AxDB is touched, so a broken query never leaves a truncated table.
+2. `Helpers/StreamingDataReader` wraps the source: each row is read once with `GetValues` into a reused buffer (so SequentialAccess works although SqlBulkCopy reads in destination column order) and tracks row count, MIN/MAX(RecId), MAX(SysRowVersion) (`TimestampHelper.CompareTimestamp`), approximate bytes and the time spent in Tier2 reads; a Tier2 read error is remembered so the status becomes `FetchError` instead of `InsertError`.
+3. AxDB: disable triggers → `TruncateWithFallbackAsync` (DELETE if FK/view-referenced) → **disable the nonclustered indexes** (see below) → `SqlBulkCopy` (TableLock, BatchSize 10,000, column mappings by name, BulkCopyTimeout 0, EnableStreaming, NotifyAfter 1,000,000 → progress log line) → **rebuild them** → enable triggers → `UpdateSequenceAsync` (not for System tables). Index rebuild and trigger re-enable run in every outcome (see below). **No transaction**, like the in-memory bulk insert: every 10,000-row batch commits, so a failure/cancel leaves a partially filled table; the table is `FetchError`/`InsertError`/"Cancelled" and the retry (Process Tables re-queue, Auto retry, Retry Failed, Process Selected) simply runs STREAM again, starting with the TRUNCATE.
+4. Saved values exactly like the standard route: SysRowVersion column → Tier2 timestamp = MAX streamed SysRowVersion, AxDB timestamp = AxDB `MAX(SysRowVersion)` (`TimestampsUpdated` → auto-save); no SysRowVersion → MaxRecId = MAX streamed RecId (`MaxRecIdsUpdated`). System tables save nothing. With timestamps saved, the next run is optimized (INCREMENTAL) and no longer streams unless `-truncate` / Force truncate mode is set.
+5. `RecordsFetched` / `RecordsToCopy` = streamed rows, `MinRecId`, `EstimatedSizeMB` recomputed (as standard); timing: Fetch = reader open + time inside Tier2 reads, Delete = TRUNCATE, Insert = bulk copy minus Tier2 read time + sequence. `CachedData` stays null.
+- Log: `Route STREAM: <reason>`, reader open time, a progress line every 1,000,000 rows (rows, ~MB, MB/s) and a final line (rows, MB, MB/s, rows/s).
+- A Tier2 reader that is abandoned mid-stream (AxDB error, cancel) is cancelled before it is closed, so closing does not drain the remaining rows.
+- Not streamed (still in memory): the optimized route's TRUNCATE branch (change/excess ≥ threshold) and its control data, KEEP, SQL strategies without `-truncate`, newest-N RecId copies without `-truncate`.
+
+**Nonclustered indexes disabled during the load** (`AxDbDataService.StreamInsertAsync` / `DisableNonclusteredIndexesAsync` / `RebuildIndexesAsync`, SQL text in `Helpers/StreamIndexSql.cs`, shared with Get SQL). Large D365 loads are disk-bound by index maintenance (DIMENSIONATTRIBUTEVALUECOMBINATION has 49 NC indexes; 1.99M rows took 48 min). Only in the STREAM route and only after the route emptied the table, so a rebuild is cheap and equivalent; in-memory, KEEP and incremental routes are unchanged.
+- **Which**: `sys.indexes` type 2 (nonclustered rowstore), not hypothetical, of `[dbo].[T]` (`StreamIndexSql.ListIndexesSql`). Enabled ones are disabled with `ALTER INDEX [x] ON [dbo].[T] DISABLE` (schema-lock timeout as for triggers), **except** those referenced by a foreign key (`sys.foreign_keys.key_index_id`) — disabling them would disable the FK; they stay enabled and are logged. Unique indexes are disabled too (uniqueness is checked again by the rebuild). The clustered index / heap is never touched.
+- **Marker — D365's own disabled indexes are never touched**: D365 itself keeps some nonclustered indexes DISABLED on purpose (indexes of switched-off configuration keys, e.g. `INVENTTABLEMODULE.I_15049TAXWITHHOLDITEMGROUPHEADING_THIDX`, `_RU` indexes, index-tuning indexes like `CreatedTrxId_*_IDX`). So every index the route disables first gets the extended property **`DBSyncTool_DisabledForLoad`** (`sys.sp_addextendedproperty … @level2type = N'INDEX'`, value = UTC time), then `ALTER INDEX … DISABLE`. Stored in the database, the marker survives a killed process; it survives DISABLE and a failed REBUILD (verified). At the start of a STREAM table (`ListIndexesSql` returns `dbsynctool_marked` from `sys.extended_properties` class 7):
+  - disabled **with** the marker → leftover of an interrupted run → rebuilt in this run (logged `still disabled by an interrupted DBSyncTool run`)
+  - disabled **without** the marker → D365's own → never disabled, rebuilt or otherwise touched (logged once: `left disabled (not disabled by DBSyncTool): …`; summary `N left disabled (D365)`)
+  - enabled **with** a stale marker (process died between marker and DISABLE, or between REBUILD and marker drop) → the marker is dropped, then the index is handled like any enabled one
+  - The marker is dropped (`sp_dropextendedproperty`) right after a successful REBUILD and **kept when the rebuild fails**, so the next STREAM run of the table rebuilds it. Extended properties were chosen over a tool-side list because they live with the index in AxDB (no config file to lose, visible to anyone inspecting the index) and need only db_owner.
+- **Rebuild**: `ALTER INDEX [x] ON [dbo].[T] REBUILD` for exactly the listed indexes, one after the other (not `ALTER INDEX ALL`, which would rebuild the clustered index too), MAXDOP default, no SORT_IN_TEMPDB — measured on 400k rows × 19 indexes: sequential 40.1 s, SORT_IN_TEMPDB 41.6 s, 4 parallel connections 40.9 s, so the simplest variant stays. Per index: `CancellationToken.None`, timeout `StreamIndexSql.RebuildCommandTimeoutSeconds` (4 h), each logged with its time; summary `rebuilt N of M … in Xs`. Disable + load + rebuild + sequence count as **Insert** time; the STREAM summary line shows the load MB/s without them plus `indexes: N disabled during the load, rebuilt in Xs`.
+- **Every outcome**: success, AxDB error, Tier2 error / resumes exhausted, Stop and the auto-stop all rebuild the listed indexes (log `rebuilding N disabled indexes after cancel/failure`) and re-enable the triggers. After a failure the original connection is discarded (`ClearPool`) and a fresh one is used; a connection lost during a rebuild is replaced and that index retried once. The original error (or the cancellation) is still what the table reports.
+- **Rebuild failure** (e.g. duplicates in Tier2 for a unique index, which the disabled index did not reject during the load): the remaining indexes are still rebuilt, triggers re-enabled, then `IndexRebuildException` → `InsertError`, message e.g. `Index [X] on T could not be rebuilt after the load and stays DISABLED (SqlException 1505: …) - find the duplicates with: SELECT <keys>, COUNT(*) … HAVING COUNT(*) > 1 ; remove them, then run: ALTER INDEX [X] ON [dbo].[T] REBUILD`. No saved values. The index keeps its marker, so the next STREAM run of the table rebuilds it automatically. Before this change the bulk insert itself failed on the duplicate (partial table).
+
+**Chunked, resumable Tier2 reads** (`Helpers/StreamChunkSql.cs` builds the SQL — pure, shared with Get SQL; `Services/Tier2ChunkedReader.cs` runs it). One long reader lives as long as the AxDB insert takes, and on Azure SQL (ApplicationIntent=ReadOnly) such reads get dropped ("transport-level error … forcibly closed", "session has been disconnected because of a high priority DDL operation" from index maintenance) — which restarted the whole table. So Tier2 is read in RecId keyset chunks of **`StreamChunkSql.ChunkSize` = 200,000 rows** (~200 MB of a wide table, a few seconds per query), ascending RecId, each a short query on the same connection; to SqlBulkCopy the chunks look like one `IDataReader`. A chunk shorter than 200,000 rows ends the stream.
+- **Whole-table RecId copy / System table with RECID**: `SELECT TOP (200000) <cols> FROM [T] WHERE [RECID] > @LastRecId ORDER BY [RECID]` (no TOP N / DESC).
+- **Newest-N RecId copy** (`-truncate` / Force truncate, RecordsToCopy < Tier2 rows): `@MinRecId = SELECT MIN([RECID]) FROM (SELECT TOP (N) [RECID] FROM [T] ORDER BY [RECID] DESC)` once, then chunks with `[RECID] >= @MinRecId AND [RECID] > @LastRecId`. Rows inserted in Tier2 during the copy (higher RecIds) are included.
+- **SQL strategy**: the `FetchSql` (placeholders replaced exactly as for the in-memory fetch: `*` → column list, `@recordCount`, `@sysRowVersionFilter` → `(1 = 1)`) becomes a derived table: `SELECT TOP (200000) <cols> FROM (<FetchSql on its own lines>) AS [stream_src] WHERE [stream_src].[RECID] > @LastRecId ORDER BY [stream_src].[RECID]`. `StreamChunkSql.TryMakeDerivedTable` tokenizes the SQL (skips strings, `[..]` / `".."` identifiers, comments, parentheses) and removes a trailing **top-level** `ORDER BY` (meaningless for the set). It refuses — the table then falls back to the single long reader, reason logged and shown in Get SQL — when the SQL does not start with `SELECT` (CTE), has several statements, a top-level `TOP` / `OFFSET` / `FETCH` (the set would be re-evaluated per chunk) / `INTO` / `OPTION` / `FOR` / `COMPUTE`, or cannot be parsed. Also not chunked: tables without a RECID column (typical System tables).
+- **Resume**: a Tier2 read (or chunk open) that fails with a transient error (`Helpers/TransientSqlErrors.cs`) is retried **inside the reader**, up to **`MaxResumeRetries` = 5** times per table, after **5, 15, 30, 60, 60 s** (`RetryDelaysSeconds`; Stop interrupts the wait): the broken connection is disposed and its pool cleared, and a new connection runs the next chunk with `@LastRecId` = RecId of the last row handed to SqlBulkCopy. That row was read completely (`GetValues`), and SqlBulkCopy never sees the error — its AxDB bulk insert and open batch just wait — so nothing is lost or copied twice and no AxDB resume query (`MAX(RECID)`) is needed. Each resume is logged (`Tier2 read failed after N rows (SqlException n: …) - resume k/5 in Xs on a new connection, continuing after RecId R`); the final line shows the number of chunk queries and resumes. After 5 resumes, or on a non-transient error, the error reaches SqlBulkCopy and the table fails (`FetchError`) as before.
+- **Transient** (`TransientSqlErrors.IsTransient`, whole exception chain incl. `SqlException.Errors`): numbers 64, 121, 233, 10053, 10054, 10060, 10061 (transport), 596, 1205, 1219, 3980, 6005 (session killed / batch aborted), 4060, 4221, 40143, 40197, 40501, 40540, 40613, 49918–49920, 10928, 10929 (Azure); any `SocketException` / `IOException`; messages containing "transport-level error", "forcibly closed", "severe error occurred on the current command", "connection was closed", "connection is broken", "physical connection is not usable", "session has been disconnected", "semaphore timeout". Not transient: command timeout (-2) and deterministic errors (syntax, missing object/column, permissions, conversion, divide by zero).
+- **Batch behavior** (verified, no transaction): when the source fails mid-batch, SqlBulkCopy aborts the in-flight batch (rolled back as one statement) and the earlier 10,000-row batches stay committed — a divide-by-zero at row 700,000 left exactly 690,000 rows, MAX(RECID) = row 690,000. The in-reader resume never interrupts a batch, so this only matters for a table that finally fails.
+- The single-reader fallback has no resume: a dropped connection fails the table (retry = TRUNCATE + full stream).
 
 ### Re-applying Settings on Process Tables
 
 **Process Tables** does not simply run the list as discovered: `CopyOrchestrator.ReapplyFiltersAndStrategiesAsync()` runs first, so the user can fix a failing table and press the button again without a full Discover Tables (which would re-query Tier2 for every table).
 
 - **Already inserted tables are never touched** — they keep `Inserted` status and are not copied twice.
-- **Tables to Exclude / System Excluded Tables / Tables to Copy** are re-applied: a table now matched by an exclusion pattern (or no longer matched by an inclusion pattern) becomes `Excluded` and is skipped. A System-strategy table whose list toggle was switched off is excluded the same way.
+- **Tables to Exclude / System Excluded Tables / Tables to Copy** are re-applied: a table now matched by an exclusion pattern (or no longer matched by an inclusion pattern) becomes `Excluded` and is skipped. A System-strategy table whose list toggle was switched off is excluded the same way. A `TableGroup:` rule uses the group map loaded by Discover Tables (one AxDB query if it was not loaded yet, e.g. the rule was added afterwards).
 - **Failed tables** (`FetchError` / `InsertError`, which includes tables cancelled by the auto-stop on first failure) are reset to `Pending` with their cached data disposed, so they are retried with the current settings. A failed **System** table is re-validated against Tier2/AxDB first (`ReapplyStrategyForTable`) and stays failed if it is still missing or its schema still differs.
 - **Copy strategy and saved values** are re-applied to every remaining table via `ApplyStrategyToTable` (fetch SQL, record count, estimated size, `UseTruncate`/`NoTruncate`, optimized-mode flags, timestamps and MaxRecId). No database round-trip: the metadata found during Discover Tables is kept.
 - The **Tier2 connection is rebuilt** from the saved configuration, so edited credentials/server take effect (same as **Retry Failed**).
 - A table that is **no longer excluded is not brought back**: the grid row is a stub without TableId or field list, which only Discover Tables can fill. Run Discover Tables for that.
 - `BtnProcessTables_Click` rejects duplicate strategy lines first (same check as Discover Tables), and the orchestrator parses all strategy lines before changing anything, so an invalid line aborts the run instead of half-applying it.
 - Every re-applied strategy, every newly excluded table and a summary line are written to the log.
+
+### Auto Retry Failed
+
+The **Auto retry failed** checkbox (Tables tab → **Other Settings**, `AppConfiguration.AutoRetryFailed`, default off) re-runs **Process Tables** automatically when an operation ends with failed tables: failed tables and the tables the auto-stop on first failure never started are processed with the current settings (see [Re-applying Settings on Process Tables](#re-applying-settings-on-process-tables)); already inserted tables are not copied again.
+
+- Only after **Process Tables**, **Run All** and **Retry Failed** (they call `ExecuteOperationAsync(..., autoRetryFailed: true)`); never after Discover Tables or Process Selected.
+- `MainForm.AutoRetryFailedTablesAsync` runs inside `ExecuteOperationAsync`'s `try`, right after the operation, so the run stays "executing" (Stop enabled, other buttons disabled). Each attempt does what the Process Tables button does: the duplicate strategy line check (`GetStrategyDuplicates`; on duplicates the auto retry is logged and stopped, no dialog), `SaveConfigurationFromUI()` (after `RefreshTimestampUI()`, so saved values written by the run are not overwritten by stale textboxes), `CopyOrchestrator.ProcessTablesAsync()`, then drops `Inserted` tables from `_pendingStrategyClears`.
+- **Bounded**: at most `MaxAutoRetries` (3) attempts per user-started operation; stops early when an attempt makes no progress (same set of failed tables **and** no new `Inserted` table). Each attempt and the stop reason are logged (`Auto retry 1/3: N failed table(s) - ...`); if failed or `Pending` tables remain afterwards, a final line lists them.
+- **User Stop is never auto-retried**: the auto-stop on first failure and the Stop button both cancel the orchestrator's token and leave `FetchError` / "Cancelled" rows, so `BtnStop_Click` sets `_userStopRequested` (reset at the start of every operation); the loop checks it before the first and after every attempt.
+- **Post-transfer actions** run in `ExecuteOperationAsync`'s `finally`, i.e. once, after the last automatic retry, with unchanged conditions (all tables `Inserted`/`Excluded`).
 
 ### Strategy Changes vs Saved Values
 
@@ -315,6 +386,49 @@ D365FO has metadata/security tables that are NOT registered in SQLDICTIONARY and
 - **Est Size(MB)** = full table size (`SizeGB × 1024`), since the entire table is copied.
 - **Processing** (`CopyOrchestrator.ProcessTableSystemModeAsync` → `AxDbDataService.InsertSystemTableDataAsync`): fetch full table → disable triggers → `TRUNCATE` (falls back to `DELETE` if FK/view-referenced) → `SqlBulkCopy` all columns → re-enable triggers. **No** delta comparison, RecId/sequence update, or timestamp persistence. Existing copy strategies are ignored for these tables.
 
+### Transaction-less Copy
+
+**Meaning:** master data, setup and parameters are refreshed from Tier2; **transactions in AxDB stay untouched** (transaction table groups are excluded, so they are neither copied nor deleted). **Prerequisite:** the local AxDB has the **same baseline as Tier2, only an older version** (an earlier restore of the same environment) — otherwise the kept transactions reference master data (items, InventDimIds, RecIds) that does not exist. Item/product master data is limited to items used on Tier2 `SALESLINE`; tables without a strategy line still follow **Records to copy**.
+
+Copies master data only, keeping item-related tables consistent. The **Init transaction-less copy** button (header of the **Tables to Exclude** group, `MainForm.BtnInitTransactionLess_Click`) only edits the two textboxes — nothing is saved until the next Discover Tables / Save, and saving runs the normal saved-values prompt for the (widened) SQL strategy lines.
+
+- **Tables to Exclude**: appends the missing lines of the `[TransactionLessExclude]` section of `DefaultValues.ini` (fallback when the section is missing: `TransactionLessHelper.DefaultTableGroupRule`), followed by the same section of `CustomValues.ini`. `DefaultValues.ini` holds the `TableGroup:` rule for Transaction (4), WorksheetHeader (5), WorksheetLine (6), Worksheet (9), TransactionHeader (10), TransactionLine (11), Staging (12) plus explicit **standard** tables whose group is not one of those (log/journal tables such as `EVENTCUD`, `DOCUHISTORY`, `WHSUOMSTRUCTURE`). Excluded tables are **not** cleaned in AxDB — their content is left as it is (by design).
+- **`CustomValues.ini`** (`DefaultValuesHelper.GetCustomFilePath`, next to the exe): customer/project specific values, e.g. tables of a customer model (identified by the customer prefix). It is **empty in the repository** and must stay that way — never commit customer table names to `DefaultValues.ini` or the code. Same format as `DefaultValues.ini`; lines before the first `[Section]` are comments. The csproj copies it to the build output (PreserveNewest) but never publishes it, so a release package does not overwrite a user's filled copy. Missing file = no custom lines (logged).
+- **Copy strategy**: `AxDbDataService.GetItemTableCandidatesAsync` lists AxDB `dbo` tables whose SQLDICTIONARY has an `ITEMID`, `PRODUCT`, `DISTINCTPRODUCT`, `DISTINCTPRODUCTVARIANT` or `PRODUCTMASTER` column. Tables matched by the (new) exclusion list or System Excluded Tables are skipped, as are tables without rows (row counts from Tier2 `DiscoverTablesAsync`; falls back to AxDB when Tier2 is not configured/reachable). `TransactionLessHelper.BuildStrategyLine` then picks the filter, first match wins:
+  1. `ECORESPRODUCT` → `RECID` or `PRODUCTMASTER` in the products of sold items (variants of sold masters)
+  2. `ITEMID` + `DATAAREAID` → `EXISTS` on `SALESLINE` with the same item and company
+  3. `ITEMID` + `ITEMDATAAREAID` → same, company from `ITEMDATAAREAID` (e.g. `INVENTITEMGROUPITEM`)
+  4. a product column (`PRODUCT` → `DISTINCTPRODUCT` → `DISTINCTPRODUCTVARIANT` → `PRODUCTMASTER`) → in the products (and variants) of sold items
+  5. `ITEMID` only → `EXISTS` on `SALESLINE` with the same item in any company
+  6. InventTable relations without an ITEMID column (checked after 1–5, all verified against AxDB data):
+     - `INVENTTABLE` **text** column = ItemId (e.g. CustomTable) → item filter on that column (+ DATAAREAID)
+     - `INVENTTABLE` **integer** column = InventTable.RecId (e.g. MCRINVENTTABLE) → `IN (0 ∪ RecIds of sold items)`
+     - `INVENTITEMBARCODE` integer = InventItemBarcode.RecId (e.g. ECORESPRODUCTBARCODEASSOCIATION) → `IN (0 ∪ barcodes of sold items)`
+     - `TransactionLessHelper.RelationTables`: standard tables with a generic link column, e.g. MCRINVENTTABLEINDEX.REFRECID → MCRINVENTTABLE of sold items, and the polymorphic TAMREBATEGROUPLINK (REFTABLEID/REFRECID: rows referencing INVENTTABLE - TableId looked up in the source SQLDICTIONARY - limited to sold items, other references kept) (checked **first**)
+     - **Configured** relations (checked before everything): `[TransactionLessItemRelations]` in DefaultValues.ini / CustomValues.ini, one `TABLE|COLUMN` per line (`TransactionLessHelper.ParseItemRelations`, read by `MainForm.LoadIniSectionLines`). Text column = ItemId (+ DATAAREAID when present), integer column = InventTable.RecId. Customer tables (e.g. an alternative-items table with an ITEM column) belong in CustomValues.ini, never in code.
+     - The column type comes from `GetItemTableCandidatesAsync` (`ItemTableCandidate.ColumnTypes`, via `sys.columns`), which also includes the RelationTables and configured tables.
+  Rows not tied to an item (`ITEMID = ''`, product column `= 0`) are always kept. Product filters use **one** `IN (SELECT CAST(0 AS BIGINT) UNION ALL <sold products> UNION ALL <their variants via join>)` list — never `OR` between several `IN` subqueries or a nested `IN (… IN (…))`: those made SQL Server choose nested loops re-reading INVENTTABLE per row (up to ~99M logical reads / several minutes per table, enough for Tier2 to kill the session or hit the command timeout). Every line ends with `AND @sysRowVersionFilter` so INCREMENTAL mode keeps working. The fragments never contain `*` because the SQL strategy replaces **every** `*` with the field list.
+- **INVENTDIM line** (`TransactionLessHelper.BuildInventDimStrategyLine`, columns from `AxDbDataService.GetTableColumnTypesAsync` = AxDB SQLDICTIONARY + `INFORMATION_SCHEMA.COLUMNS` types): keeps rows where `INVENTSITEID`, `INVENTLOCATIONID` or `INVENTSTATUSID` is set and **every other dimension column is empty** — the site/warehouse/status level dims referenced by item master data. Not hard-coded: every INVENTDIM column counts as a dimension except `InventDimNonDimensionColumns` (`INVENTDIMID`, `SHA1HASHHEX`, `SHA3HASHHEX`, `HASHTYPE`), system fields (FIELDID ≥ 60000 or `SystemFieldNames`), `DEL_*` fields and the `…TZID` companion of a UtcDateTime dimension (`INVENTDIMENSION9TZID` defaults to 37001 even when the date is empty). "Empty" by SQL type (`EmptyValueFor`): `''` strings, `'1900-01-01'` dates, `0` numbers; a column of another type is logged as a warning and not filtered. Skipped like the other lines when INVENTDIM is excluded or empty. The line ends with `AND @sysRowVersionFilter -keep`; the log lists required/empty/ignored columns.
+  - **Why `-keep`, not `-notruncate`**: AxDB INVENTDIM is far larger than the fetched subset (the kept transaction tables reference its other rows). `-notruncate` only exempts the table from **Force truncate mode** — smart TRUNCATE detection (excess > threshold), the delta comparison (`DELETE … RecId >= MinRecId` not in the set) and the optimized mode (TRUNCATE on excess %, incremental deletes) would still remove those rows. [KEEP mode](#keep-mode--keep) only upserts the fetched rows.
+- `TransactionLessHelper.MergeStrategyLines` replaces an existing line for a generated table in place, appends new ones and leaves all other lines untouched.
+- `MainForm.LoadTransactionLessExcludeLines` reads the two `[TransactionLessExclude]` sections (DefaultValues.ini, then CustomValues.ini; fallback `DefaultTableGroupRule`) — shared by Init and **Copy Truncate TSQL**, so both always use the same table list.
+- **Copy Truncate TSQL** (action row next to Copy to Clipboard, `MainForm.BtnCopyTruncateSql_Click`) copies a script built by `Helpers/TransactionTruncateSqlBuilder.cs` (pure) that empties the transaction tables of the **local AxDB**, for users who want a consistent database (master data from Tier2, no transactions). The tool never executes it. Script design:
+  - `TableGroup:` rules → `@Groups`, resolved **in the target DB at run time** (SQLDICTIONARY + TABLEMETADATATABLE, like the original cleanup script); exact names → `@Names`; `*` patterns → `@Patterns` (`LIKE`, with `_ % [` escaped). Only existing `dbo` tables with rows are processed.
+  - `@Execute = 0` (default) only lists tables, reason and row counts; `@Execute = 1` truncates.
+  - Per table: own transaction, CDC disable/enable when `is_tracked_by_cdc`, `TRUNCATE TABLE`; errors 3729/4712 (indexed view / foreign key) fall back to `DELETE TOP (100000)` batches; other errors are printed and the cursor continues.
+  - Verified: list mode on a real AxDB (8,581 transaction tables, 211 with rows); execute mode on a scratch DB (group rule, explicit, pattern, FK fallback, master data kept, empty/missing tables skipped).
+
+### Columnstore Guard (SQL Server bug 3624)
+
+On SQL Server 2019 (seen on 15.0.4500.2, RTM-CU32-GDR) **any SqlBulkCopy** (with or without TableLock, even 100 rows) into a table that has an enabled **nonclustered columnstore index** (type 6) **and** an enabled nonclustered rowstore index containing a **rowversion** column (`SYSROWVERSION`, `system_type_id` 189 — D365 creates these itself, named `dbo<TABLE><GUID>`) fails with assertion 3624 / error 17066 (`xmerror.cpp`, stack dump) and the session is killed. `INSERT … SELECT` is not affected (so KEEP's insert from `#keep` is safe). Affected D365 tables include GENERALJOURNALACCOUNTENTRY, GENERALJOURNALENTRY, CUSTINVOICEJOUR/TRANS, BUDGETTRANSACTIONHEADER/LINE, RETAILCUSTINVOICEJOURTABLE and the RETAILTRANSACTION* tables (transaction tables, so the transaction-less copy never hits it).
+
+- `StreamIndexSql.ListColumnstoreSql` lists the type-6 indexes with disabled flag, marker and `rowversion_index_enabled`. `AxDbDataService.DisableColumnstoreForBulkLoadAsync` runs right before **every** SqlBulkCopy into an AxDB table: enabled + `rowversion_index_enabled` → marker (`DBSyncTool_DisabledForLoad`, the same extended property as the STREAM indexes) + `ALTER INDEX … DISABLE`; disabled with marker → leftover, rebuilt too; disabled without marker → D365's own, untouched; stale marker on an enabled index → dropped. Rebuilding a columnstore index of 500,000 rows takes 2–10 s.
+- **In-memory route** (`InsertDataAsync`, standard / delta / optimized TRUNCATE branch) and **System route** (`InsertSystemTableDataAsync`): rebuilt with `RebuildIndexesAsync` after the bulk copy; after a failure/cancel `RebuildColumnstoreAfterFailureAsync` rebuilds on a fresh connection (the bug kills the session) and the triggers are re-enabled on a fresh connection when the old one is closed (`EnableTriggersAfterFailureAsync`). A failed rebuild after a successful load → `IndexRebuildException`.
+- **STREAM route**: called after `DisableNonclusteredIndexesAsync`, so normally a no-op (the SYSROWVERSION indexes are already disabled); it picks up columnstore leftovers of an interrupted in-memory load, rebuilt with the other indexes.
+- **INCREMENTAL route** (`CopyOrchestrator.ProcessTableOptimizedAsync`, its own SqlBulkCopy inside the table's transaction): `DisableColumnstoreInTransactionAsync` / `RebuildColumnstoreInTransactionAsync` run inside that transaction, so a rollback (including the one SQL Server does when the session dies) re-enables the index and drops the marker by itself.
+- **Get SQL** appends a `COLUMNSTORE GUARD` section for every route except KEEP (`SqlPreviewBuilder.ColumnstoreGuardNote`).
+- Verified on a real AxDB: Force truncate copy of the affected tables (previously error 3624) and an INCREMENTAL run inserting missing rows (previously error 3624) both succeed; no disabled columnstore index, marker or disabled trigger left.
+
 ### SQLDICTIONARY Caching
 
 Critical optimization in `Models/SqlDictionaryCache.cs`:
@@ -338,6 +452,7 @@ Critical optimization in `Models/SqlDictionaryCache.cs`:
 - `ParallelWorkers` setting controls concurrent table processing (default: 10)
 - Saved values storage — newline-separated `TABLENAME,value` entries, **comma**-separated (not pipe), table name uppercased: `Tier2Timestamps` and `AxDBTimestamps` hold `TABLENAME,0xHEXVALUE`, `MaxTransferredRecIds` holds `TABLENAME,12345`. Written by `TimestampManager.FormatTimestampText` / `MaxRecIdManager.FormatMaxRecIdText` and parsed back by their `Parse*` counterparts; `SavedValuesHelper` splits on the same comma when clearing a table's values
 - `TruncateThresholdPercent` controls INCREMENTAL vs TRUNCATE mode decision (default: 40)
+- `AutoRetryFailed`: automatic bounded re-run of Process Tables after Process Tables / Run All / Retry Failed ends with failed tables (default: false)
 - `PowerShellScriptPath`: Path to .ps1 script executed after backup
 - `PowerShellAutoExecute`: Whether to auto-run PowerShell script after successful backup
 - `LastBackupPath`: Resolved path from last successful backup (persisted for manual PowerShell execution)
@@ -457,10 +572,12 @@ Used when changes ≥ threshold OR `-truncate` flag OR first run with excess rec
 4. Update sequence to max(RecId)+1
 5. Save new timestamps (Tier2 and AxDB max values)
 
+A large `-truncate` / Force-truncate table runs these steps as the [STREAM route](#stream-mode-large-tables) (TRUNCATE, then Tier2 reader → SqlBulkCopy without loading the rows); the TRUNCATE branch of the optimized mode still loads the full fetch into memory.
+
 **Triggers TRUNCATE mode when:**
 - Change percentage ≥ threshold (default 40%)
 - `-truncate` flag specified in strategy
-- **Force truncate mode** checkbox is on — unless the table's strategy line carries `-notruncate`
+- **Force truncate mode** checkbox is on — unless the table's strategy line carries `-notruncate` (or `-keep`, which never truncates — see [KEEP Mode](#keep-mode--keep))
 - First run detected excess records: `(AxDB_count - Fetched_count) / Fetched_count > Threshold%`
 
 ### Delta Comparison v2 (Standard Mode)
@@ -522,8 +639,8 @@ Used for tables without SysRowVersion OR when optimization not available:
 **Get SQL Feature** (right-click context menu in MainForm)
 - Copies to the clipboard a preview of everything the selected table(s) will go through, without executing anything
 - Built by `Helpers/SqlPreviewBuilder.cs` (a pure function of `TableInfo` + `AppConfiguration`, so it can be rendered/tested outside the UI)
-- **Must stay in sync** with `CopyOrchestrator.ProcessSingleTableAsync` / `ProcessTableOptimizedAsync` / `ProcessTableStandardModeAsync` / `ProcessTableSystemModeAsync` and `AxDbDataService.InsertDataAsync` / `ExecuteIncrementalDeletesAsync` / `UpdateSequenceAsync`
-- `GetPreviewRoute` reproduces the runtime routing exactly: **System → UseTruncate (skips optimization) → UseOptimizedMode → standard**, including the fallback for a SQL strategy with no `@sysRowVersionFilter` (which drops to standard inside `ProcessTableOptimizedAsync`)
+- **Must stay in sync** with `CopyOrchestrator.ProcessSingleTableAsync` / `ProcessTableOptimizedAsync` / `ProcessTableStandardModeAsync` / `ProcessTableSystemModeAsync` / `ProcessTableKeepModeAsync` / `ProcessTableStreamModeAsync` and `AxDbDataService.InsertDataAsync` / `ExecuteIncrementalDeletesAsync` / `UpsertKeepExistingAsync` / `StreamInsertAsync` / `UpdateSequenceAsync`, `Tier2DataService.OpenStreamReaderAsync` / `OpenChunkedStreamReaderAsync` / `Tier2ChunkedReader` (the chunk / boundary SQL comes from `StreamChunkSql`, the index list / DISABLE / REBUILD statements from `StreamIndexSql`, in both places) (the KEEP statements come from `KeepModeSql` in both places; unique index keys are only known at runtime, so the preview shows them as `<key column N>`)
+- `GetPreviewRoute` reproduces the runtime routing exactly: **System (large → Stream) → KeepExisting → Stream → UseTruncate (skips optimization) → UseOptimizedMode → standard**, the Stream decision being the same `StreamModeRules.ShouldStream` call the runtime makes, including the fallback for a SQL strategy with no `@sysRowVersionFilter` (which drops to standard inside `ProcessTableOptimizedAsync`)
 - Header states the route and *why*, plus the inputs that drive it: Tier2 rows, effective record count, threshold %, presence of SysRowVersion/RECVERSION, saved timestamps and MaxRecId (marked "present but NOT used in this mode" when the route ignores them), AxDB TableId and sequence name
 - Branches that depend on live data are shown as labelled alternatives (TRUNCATE vs INCREMENTAL; delta comparison B1/B2/B3), while branches ruled out by the table's own properties are omitted or shown as "Skipped: …"
 - Queries match the executed statements, including the `#Tier2Control` temp table, the **three** incremental deletes, `DELETE … WHERE RecId < @MinRecId` for whole-table copies, batched `DELETE … WHERE RecId IN (…)` (5,000 per batch), trigger disable/enable, and `ALTER SEQUENCE … RESTART WITH MAX(@MaxRecId, @CurrentSeq) + 10000`
@@ -537,10 +654,13 @@ Used for tables without SysRowVersion OR when optimization not available:
 - Memory-efficient: Only N tables in memory at once (where N = parallel workers)
 - Connection pooling enabled with `Max Pool Size=20` in connection string
 
-**Pattern Matching**
+**Pattern Matching** (`Helpers/TablePatternMatcher.cs`)
 - Wildcard patterns support (e.g., `CUST*`, `*Staging`, `Sys*`)
 - Only wildcard character is `*` (matches zero or more characters)
 - Converted to regex internally: `^pattern.*$` for case-insensitive matching
+- **Table group rule**: a line `TableGroup:Transaction,WorksheetLine,12` matches every table whose D365FO TableGroup (enum name or number, see `TablePatternMatcher.TableGroupValues`) is listed. Groups are read from the **AxDB** `SQLDICTIONARY` + `TABLEMETADATATABLE` (`AxDbDataService.GetTableGroupsAsync`), keyed by SQL table name; a table missing there never matches a group rule. An unknown group name is an error that aborts Discover / Process Tables
+- Patterns are compiled once per list (`CopyOrchestrator.BuildMatcherAsync`): exact names are a HashSet lookup, each wildcard regex is built once — needed because a TableGroup rule or long explicit lists would otherwise cost one regex construction per table × pattern
+- The group map is loaded on demand (only when a list contains a rule), reloaded at the start of every Discover Tables and reused by Process Tables' re-apply step
 - Applied to both inclusion and exclusion lists
 - Exclusions applied after inclusions
 
@@ -584,14 +704,14 @@ Used for tables without SysRowVersion OR when optimization not available:
 - **ReapplyStrategyForTable**: Reloads timestamps from config when processing single table via "Process Selected"
 
 ### Database Operations
-- Insert operations use transaction with rollback on error
+- The bulk insert is **not** transactional: `SqlBulkCopy` commits every 10,000-row batch. A failed or cancelled table (incl. the auto-stop on first failure) is left truncated/cleaned and partly filled until it is processed again
 - Triggers always re-enabled in finally block even on error
-- SqlBulkCopy settings: table lock enabled, batch size 10,000 rows
+- SqlBulkCopy settings: batch size 10,000 rows, column mappings by name. The in-memory inserts use default options (no TableLock) and the AxDB command timeout; the [STREAM route](#stream-mode-large-tables) uses TableLock (the table was just truncated → minimal logging possible), BulkCopyTimeout 0 and EnableStreaming, and disables the table's nonclustered indexes (except FK-referenced ones) for the load and rebuilds them afterwards in every outcome
 - Connection timeout only used for Tier2 (default: 3 seconds)
 - Command timeout: Tier2 default 600 seconds, AxDB default 0 (unlimited)
 
 ### Memory & Performance
-- Memory usage: Significantly reduced with merged workflow (only N tables in memory where N = parallel workers)
+- Memory usage: Significantly reduced with merged workflow (only N tables in memory where N = parallel workers). An in-memory table costs roughly 2.4x its Tier2 size; large whole-table / TRUNCATE / System copies take the [STREAM route](#stream-mode-large-tables) and use a flat few MB regardless of size (thresholds: `StreamModeRules.MinRowsToStream` 1,000,000 rows / `MinSizeMBToStream` 500 MB)
 - Control queries for optimization: ~1KB per 1000 records vs ~100MB for full data
 - UI updates: Table list refreshes every 3 seconds during execution, status line updates per table completion
 - SQLDICTIONARY caching provides 10-20x speedup over individual metadata queries
@@ -628,12 +748,15 @@ Used for tables without SysRowVersion OR when optimization not available:
 
 **UI-specific modifications:**
 - MainForm uses TabControl with five tabs: "Tables" (static), "Connection-{Alias}" (dynamic), "System" (system tables copy — checkbox + list + Init button), "Saved Values" (timestamps/RecIds), "Post-Transfer Actions" (SQL scripts, backup, PowerShell)
-- Post-transfer execution chain: SQL scripts → Database Backup → PowerShell script (each step conditional on previous success)
+- Post-transfer execution chain: SQL scripts → Database Backup → PowerShell script (each step conditional on previous success); runs from `ExecuteOperationAsync`'s `finally`, after any automatic retries
+- Other Settings group (`grpCol4`): Records to copy, **Force truncate mode**, **Auto retry failed** (see [Auto Retry Failed](#auto-retry-failed)), **Execute Post-Transfer Actions**
 - DataGridView bound to `List<TableInfo>` via events from CopyOrchestrator
+- Tables to Exclude group button: **Init transaction-less copy** (see [Transaction-less Copy](#transaction-less-copy)); the group label tooltip documents the `TableGroup:` syntax
 - Copy strategy group buttons: **Sort** (sort strategies + save) and **Clear Saved** (clear saved values for selected strategy lines — see [Strategy Changes vs Saved Values](#strategy-changes-vs-saved-values))
 - The **Per-Table Strategy (?)** label is clickable: hovering shows the help as a tooltip, clicking opens the same text in a resizable, scrollable, copyable window (`MainForm.LblStrategyOverrides_Click`). Both read the single `MainForm.StrategyHelpText` constant in `MainForm.Designer.cs` — edit the help there and both stay in sync
 - Help text under "AxDB Backup After Transfer" is a read-only borderless TextBox (`txtBackupDatabaseHelp`), not a Label, so the example path can be selected and copied — same pattern as `txtLastBackupPath`
 - Context menu items: "Copy Table Name" and "Get SQL"
 - Error column truncates to 50 chars, full error in tooltip
+- **Est Size(MB)** before the fetch comes from `Helpers/SizeEstimate.cs` (Discover Tables and `ApplyStrategyToTable`): RecId strategies and SQL using `@recordCount` → `MIN(records to copy, Tier2 rows) × BytesPerRow`; a SQL filter without `@recordCount` has unknown selectivity → the AxDB row count (`TableInfo.AxDbRowCount`, one `GetTableRowCountsAsync` query in Discover) when the table is in sync (optimized mode, not `-keep`), else **unknown**: `EstimatedSizeUnknown` → grid shows `?`, excluded from the "MB to copy" total, which notes "+N SQL-filtered table(s) of unknown size". Setting `EstimatedSizeMB` (e.g. with the fetched size) clears the flag.
 - Action buttons enabled/disabled based on execution state via event handlers
 - Fields to Exclude configured on Connection tab (next to System Excluded Tables)

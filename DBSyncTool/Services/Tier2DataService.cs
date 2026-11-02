@@ -331,6 +331,112 @@ namespace DBSyncTool.Services
         }
 
         /// <summary>
+        /// An open Tier2 reader for the STREAM route. Disposing it closes reader, command and
+        /// connection and drops the cancellation registration.
+        /// </summary>
+        public sealed class StreamSource : IDisposable
+        {
+            internal SqlConnection Connection { get; init; } = null!;
+            internal SqlCommand Command { get; init; } = null!;
+            public SqlDataReader Reader { get; internal set; } = null!;
+            public CommandBehavior Behavior { get; internal set; }
+            internal CancellationTokenRegistration Registration { get; set; }
+
+            /// <summary>Set by the caller once every row was read.</summary>
+            public bool Completed { get; set; }
+
+            public void Dispose()
+            {
+                Registration.Dispose();
+
+                // Closing a SqlDataReader that still has rows pending drains them all from the
+                // server first - for a multi-GB table after an AxDB error that would take as long
+                // as the copy itself. Cancel the command first so Close returns at once.
+                if (!Completed && Reader != null && !Reader.IsClosed)
+                {
+                    try { Command.Cancel(); } catch { /* best-effort */ }
+                }
+
+                try { Reader?.Dispose(); } catch { /* reader may be mid-stream after a cancel */ }
+                Command.Dispose();
+                Connection.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// STREAM route: executes the normal fetch SQL (same text as FetchDataBySqlAsync) on a
+        /// dedicated connection and returns the open reader instead of filling a DataTable.
+        /// CommandBehavior.SequentialAccess (columns are consumed strictly in order by
+        /// StreamingDataReader's GetValues); if the server/driver rejects it, it falls back to
+        /// the default behavior. Same CommandTimeout as every Tier2 query (per network read,
+        /// like DataAdapter.Fill). The cancellation token is wired to SqlCommand.Cancel so Stop
+        /// aborts the server-side query while rows are flowing.
+        /// </summary>
+        public async Task<StreamSource> OpenStreamReaderAsync(string tableName, string sql, CancellationToken cancellationToken)
+        {
+            _logger($"[Tier2 SQL] Streaming data from {tableName}: {sql}");
+
+            var connection = new SqlConnection(_connectionString);
+            var command = new SqlCommand(sql, connection) { CommandTimeout = _connectionSettings.CommandTimeout };
+            var source = new StreamSource { Connection = connection, Command = command };
+
+            try
+            {
+                await connection.OpenAsync(cancellationToken);
+                source.Registration = cancellationToken.Register(() =>
+                {
+                    try { command.Cancel(); } catch { /* best-effort */ }
+                });
+
+                try
+                {
+                    source.Reader = await command.ExecuteReaderAsync(CommandBehavior.SequentialAccess, cancellationToken);
+                    source.Behavior = CommandBehavior.SequentialAccess;
+                }
+                catch (Exception ex) when (ex is ArgumentException or InvalidOperationException && !cancellationToken.IsCancellationRequested)
+                {
+                    _logger($"[Tier2] {tableName}: SequentialAccess not usable ({ex.Message}), streaming with default behavior");
+                    source.Reader = await command.ExecuteReaderAsync(CommandBehavior.Default, cancellationToken);
+                    source.Behavior = CommandBehavior.Default;
+                }
+
+                return source;
+            }
+            catch (SqlException) when (cancellationToken.IsCancellationRequested)
+            {
+                source.Dispose();
+                throw new OperationCanceledException(cancellationToken);
+            }
+            catch
+            {
+                source.Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Chunked STREAM route: opens a <see cref="Tier2ChunkedReader"/> for the plan built by
+        /// StreamChunkSql (RecId keyset chunks, resumable after transient connection errors).
+        /// The first chunk is opened here, before AxDB is touched.
+        /// </summary>
+        public async Task<Tier2ChunkedReader> OpenChunkedStreamReaderAsync(string tableName, StreamChunkSql.Plan plan, CancellationToken cancellationToken)
+        {
+            _logger($"[Tier2 SQL] Streaming {tableName} in chunks of {StreamChunkSql.ChunkSize:N0} rows ({plan.Description}): {plan.ChunkSql}");
+
+            var reader = new Tier2ChunkedReader(_connectionString, _connectionSettings.CommandTimeout, plan, tableName, _logger, cancellationToken);
+            try
+            {
+                await reader.OpenAsync();
+                return reader;
+            }
+            catch
+            {
+                reader.Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>
         /// Fetches control data (RecId, SysRowVersion) for optimized comparison
         /// </summary>
         public async Task<DataTable> FetchControlDataAsync(

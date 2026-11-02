@@ -41,6 +41,10 @@ namespace DBSyncTool.Models
         // Force truncate mode for all tables
         public bool TruncateAllTables { get; set; } = false;
 
+        // Automatically run Retry Failed (bounded) when Process Tables / Run All / Retry Failed
+        // ends with failed tables
+        public bool AutoRetryFailed { get; set; } = false;
+
         // New timestamp storage for SysRowVersion optimization
         public string Tier2Timestamps { get; set; } = "";  // Multiline: TableName,0xTimestamp
         public string AxDBTimestamps { get; set; } = "";   // Multiline: TableName,0xTimestamp

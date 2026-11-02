@@ -123,6 +123,8 @@ namespace DBSyncTool.Services
             _logger($"[AxDB SQL] {disableTriggersSql}");
             await ExecuteNonQueryAsync(disableTriggersSql, connection, null, cancellationToken, TriggerCommandTimeoutSeconds);
 
+            var columnstoreToRebuild = new List<StreamIndex>();  // disabled for the bulk insert (SQL Server bug), rebuilt in every outcome
+            bool succeeded = false;
             try
             {
                 // Step 2: Truncate (falls back to DELETE if referenced by FK/view)
@@ -137,36 +139,752 @@ namespace DBSyncTool.Services
                 if (tableInfo.CachedData != null && tableInfo.CachedData.Rows.Count > 0)
                 {
                     _logger($"[AxDB] Bulk inserting {tableInfo.CachedData.Rows.Count} rows into {tableInfo.TableName}");
-                    using var bulkCopy = new SqlBulkCopy(connection);
-                    bulkCopy.DestinationTableName = tableInfo.TableName;
-                    bulkCopy.BatchSize = 10000;
-                    bulkCopy.BulkCopyTimeout = _connectionSettings.CommandTimeout;
+                    await DisableColumnstoreForBulkLoadAsync(tableInfo.TableName, connection, columnstoreToRebuild, cancellationToken);
 
-                    foreach (DataColumn column in tableInfo.CachedData.Columns)
+                    using (var bulkCopy = new SqlBulkCopy(connection))
                     {
-                        bulkCopy.ColumnMappings.Add(column.ColumnName, column.ColumnName);
-                    }
+                        bulkCopy.DestinationTableName = tableInfo.TableName;
+                        bulkCopy.BatchSize = 10000;
+                        bulkCopy.BulkCopyTimeout = _connectionSettings.CommandTimeout;
 
-                    await bulkCopy.WriteToServerAsync(tableInfo.CachedData, cancellationToken);
+                        foreach (DataColumn column in tableInfo.CachedData.Columns)
+                        {
+                            bulkCopy.ColumnMappings.Add(column.ColumnName, column.ColumnName);
+                        }
+
+                        await bulkCopy.WriteToServerAsync(tableInfo.CachedData, cancellationToken);
+                    }
                     rowCount = tableInfo.CachedData.Rows.Count;
+
+                    if (columnstoreToRebuild.Count > 0)
+                    {
+                        var rebuildFailures = await RebuildIndexesAsync(tableInfo.TableName, columnstoreToRebuild, connection, new StreamInsertResult());
+                        columnstoreToRebuild.Clear();
+                        if (rebuildFailures.Count > 0)
+                            throw new IndexRebuildException(string.Join(" | ", rebuildFailures), null);
+                    }
                 }
                 insertStopwatch.Stop();
                 tableInfo.InsertTimeSeconds = (decimal)insertStopwatch.Elapsed.TotalSeconds;
 
+                succeeded = true;
                 return rowCount;
             }
             finally
             {
-                // Always re-enable triggers, even on error/cancellation
+                if (!succeeded)
+                    await RebuildColumnstoreAfterFailureAsync(tableInfo.TableName, columnstoreToRebuild);
+
+                // Always re-enable triggers, even on error/cancellation (fresh connection when a
+                // fatal error closed the session)
                 try
                 {
-                    await ExecuteNonQueryAsync($"ALTER TABLE [{tableInfo.TableName}] ENABLE TRIGGER ALL", connection, null,
-                        CancellationToken.None, TriggerCommandTimeoutSeconds);
+                    await EnableTriggersAfterFailureAsync(tableInfo.TableName, connection);
                 }
                 catch
                 {
                     // Ignore errors when re-enabling triggers
                 }
+            }
+        }
+
+        /// <summary>Outcome of <see cref="StreamInsertAsync"/> (index handling, for the log / timings).</summary>
+        public sealed class StreamInsertResult
+        {
+            public int IndexesDisabled { get; set; }          // disabled by this run
+            public int IndexesPreDisabled { get; set; }       // disabled + DBSyncTool marker (interrupted run) - rebuilt too
+            public int IndexesLeftDisabled { get; set; }      // disabled without marker = D365's own, never touched
+            public int IndexesKeptForForeignKeys { get; set; }
+            public int IndexesRebuilt { get; set; }
+            public double DisableSeconds { get; set; }
+            public double RebuildSeconds { get; set; }
+        }
+
+        /// <summary>
+        /// Thrown when a nonclustered index disabled for a STREAM load cannot be rebuilt (e.g. a
+        /// unique index finds duplicates). The message names the index and the SQL to fix it.
+        /// </summary>
+        public sealed class IndexRebuildException : Exception
+        {
+            public IndexRebuildException(string message, Exception? inner) : base(message, inner) { }
+        }
+
+        private sealed record StreamIndex(string Name, bool IsUnique, string KeyColumns);
+
+        /// <summary>
+        /// STREAM route: disable triggers → TRUNCATE (DELETE fallback) → disable the enabled
+        /// nonclustered indexes (not those referenced by a foreign key) → SqlBulkCopy straight
+        /// from <paramref name="source"/> (a streaming Tier2 reader, never materialized) →
+        /// REBUILD exactly the disabled indexes (incl. ones left disabled by an earlier crash) →
+        /// enable triggers → optional sequence update.
+        /// The index rebuild and the trigger re-enable run in EVERY outcome (success, AxDB or
+        /// Tier2 error, Stop) without the cancellation token, on a fresh connection when the bulk
+        /// copy left the original one unusable. A failed rebuild ends the table with an
+        /// <see cref="IndexRebuildException"/> (other indexes are still rebuilt).
+        /// No transaction: like the in-memory bulk insert, every 10,000-row batch commits on its
+        /// own, so a failure leaves a partial table - a retry starts with the TRUNCATE again.
+        /// TableLock (bulk update lock on the freshly truncated table, allows minimal logging)
+        /// and BulkCopyTimeout 0 (the duration is set by the Tier2 read speed, not by AxDB).
+        /// Sets DeleteTimeSeconds (TRUNCATE) and InsertTimeSeconds (index disable + bulk copy
+        /// incl. the time spent waiting for Tier2 - the caller splits that off - + rebuild + sequence).
+        /// </summary>
+        public async Task<StreamInsertResult> StreamInsertAsync(
+            TableInfo tableInfo,
+            IDataReader source,
+            bool updateSequence,
+            Action<long>? progress,
+            CancellationToken cancellationToken)
+        {
+            string t = tableInfo.TableName;
+            var result = new StreamInsertResult();
+            var toRebuild = new List<StreamIndex>();
+            var connection = new SqlConnection(_connectionString);
+
+            try
+            {
+                await connection.OpenAsync(cancellationToken);
+
+                string disableTriggersSql = $"ALTER TABLE [{t}] DISABLE TRIGGER ALL";
+                _logger($"[AxDB SQL] {disableTriggersSql}");
+                await ExecuteNonQueryAsync(disableTriggersSql, connection, null, cancellationToken, TriggerCommandTimeoutSeconds);
+
+                Exception? failure = null;
+                var insertStopwatch = new Stopwatch();
+                try
+                {
+                    var deleteStopwatch = Stopwatch.StartNew();
+                    await TruncateWithFallbackAsync(t, connection, null, cancellationToken);
+                    deleteStopwatch.Stop();
+                    tableInfo.DeleteTimeSeconds = (decimal)deleteStopwatch.Elapsed.TotalSeconds;
+
+                    insertStopwatch.Start();
+                    await DisableNonclusteredIndexesAsync(t, connection, toRebuild, result, cancellationToken);
+                    // Normally a no-op here (the SYSROWVERSION indexes were just disabled), but it also
+                    // rebuilds columnstore indexes left disabled by an interrupted in-memory load
+                    await DisableColumnstoreForBulkLoadAsync(t, connection, toRebuild, cancellationToken);
+
+                    _logger($"[AxDB] Streaming bulk insert into {t} (TableLock, batch size 10,000, no transaction)");
+                    using (var bulkCopy = new SqlBulkCopy(connection, SqlBulkCopyOptions.TableLock, null))
+                    {
+                        bulkCopy.DestinationTableName = t;
+                        bulkCopy.BatchSize = 10000;
+                        bulkCopy.BulkCopyTimeout = 0;
+                        bulkCopy.EnableStreaming = true;
+
+                        for (int i = 0; i < source.FieldCount; i++)
+                        {
+                            string name = source.GetName(i);
+                            bulkCopy.ColumnMappings.Add(name, name);
+                        }
+
+                        if (progress != null)
+                        {
+                            bulkCopy.NotifyAfter = StreamModeRules.ProgressEveryRows;
+                            bulkCopy.SqlRowsCopied += (_, e) => progress(e.RowsCopied);
+                        }
+
+                        await bulkCopy.WriteToServerAsync(source, cancellationToken);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    failure = ex;
+                }
+
+                // ---- Every outcome from here on: rebuild the disabled indexes, re-enable triggers ----
+                var rebuildFailures = new List<string>();
+                try
+                {
+                    if (failure != null || connection.State != ConnectionState.Open)
+                    {
+                        // An aborted bulk copy can leave the connection unusable: close it for good
+                        // (ClearPool ends the server session) and continue on a fresh one
+                        try { SqlConnection.ClearPool(connection); } catch { }
+                        connection.Dispose();
+                        connection = new SqlConnection(_connectionString);
+                        await connection.OpenAsync(CancellationToken.None);
+                    }
+
+                    if (toRebuild.Count > 0)
+                    {
+                        if (failure != null)
+                            _logger($"[AxDB] {t}: rebuilding {toRebuild.Count} disabled indexes after cancel/failure");
+                        rebuildFailures = await RebuildIndexesAsync(t, toRebuild, connection, result);
+                    }
+
+                    string enableTriggersSql = $"ALTER TABLE [{t}] ENABLE TRIGGER ALL";
+                    _logger($"[AxDB SQL] {enableTriggersSql}");
+                    await ExecuteNonQueryAsync(enableTriggersSql, connection, null, CancellationToken.None, TriggerCommandTimeoutSeconds);
+                }
+                catch (Exception cleanupEx) when (failure != null)
+                {
+                    // Keep the original error; say exactly what is left to do by hand
+                    string left = toRebuild.Count > result.IndexesRebuilt
+                        ? " Run for every disabled index: " + string.Join(" ; ", toRebuild.Select(i => StreamIndexSql.Rebuild(t, i.Name))) + " ;"
+                        : "";
+                    string message = $"Cleanup after the failed load of {t} failed ({cleanupEx.Message}).{left} ALTER TABLE [{t}] ENABLE TRIGGER ALL";
+                    _logger($"[AxDB] ERROR: {message}");
+                    rebuildFailures.Add(message);
+                }
+
+                if (failure != null)
+                {
+                    if (rebuildFailures.Count > 0 && failure is not OperationCanceledException && !cancellationToken.IsCancellationRequested)
+                        throw new IndexRebuildException(failure.Message + " | " + string.Join(" | ", rebuildFailures), failure);
+                    System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+                }
+
+                if (updateSequence)
+                    await UpdateSequenceAsync(tableInfo, connection, null, cancellationToken);
+
+                insertStopwatch.Stop();
+                tableInfo.InsertTimeSeconds = (decimal)insertStopwatch.Elapsed.TotalSeconds;
+
+                if (rebuildFailures.Count > 0)
+                    throw new IndexRebuildException(string.Join(" | ", rebuildFailures), null);
+
+                return result;
+            }
+            finally
+            {
+                connection.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Disables every enabled nonclustered rowstore index of the (empty) table except those a
+        /// foreign key references. Each one first gets the DBSyncTool marker (extended property
+        /// StreamIndexSql.MarkerName), then ALTER INDEX ... DISABLE. Disabled indexes WITH the
+        /// marker are leftovers of an interrupted run and are rebuilt too; disabled indexes
+        /// WITHOUT it are disabled by D365 on purpose (configuration keys, index tuning) and are
+        /// never touched. A stale marker on an enabled index (interrupted between marker and
+        /// DISABLE, or between REBUILD and marker drop) is removed first.
+        /// <paramref name="toRebuild"/> is filled as it goes, so a failure halfway still rebuilds
+        /// what was disabled.
+        /// </summary>
+        private async Task DisableNonclusteredIndexesAsync(string tableName, SqlConnection connection,
+            List<StreamIndex> toRebuild, StreamInsertResult result, CancellationToken cancellationToken)
+        {
+            var sw = Stopwatch.StartNew();
+            var candidates = new List<StreamIndex>();
+            var keptForFk = new List<string>();
+            var leftovers = new List<string>();
+            var d365Disabled = new List<string>();
+            var staleMarkers = new List<string>();
+
+            using (var command = new SqlCommand(StreamIndexSql.ListIndexesSql, connection))
+            {
+                command.Parameters.AddWithValue("@Table", StreamIndexSql.QualifiedTable(tableName));
+                command.CommandTimeout = TriggerCommandTimeoutSeconds;
+                using var reader = await command.ExecuteReaderAsync(cancellationToken);
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    var index = new StreamIndex(reader.GetString(0), reader.GetBoolean(2), reader.IsDBNull(4) ? "" : reader.GetString(4));
+                    bool disabled = reader.GetBoolean(1);
+                    bool fkReferenced = reader.GetInt32(3) == 1;
+                    bool marked = reader.GetInt32(5) == 1;
+
+                    if (disabled && marked)
+                    {
+                        toRebuild.Add(index);
+                        leftovers.Add(index.Name);
+                    }
+                    else if (disabled)
+                    {
+                        d365Disabled.Add(index.Name);
+                    }
+                    else
+                    {
+                        if (marked)
+                            staleMarkers.Add(index.Name);
+                        if (fkReferenced)
+                            keptForFk.Add(index.Name);
+                        else
+                            candidates.Add(index);
+                    }
+                }
+            }
+
+            if (leftovers.Count > 0)
+                _logger($"[AxDB] {tableName}: {leftovers.Count} nonclustered index(es) still disabled by an interrupted DBSyncTool run (marker {StreamIndexSql.MarkerName}) - rebuilt after the load too: {string.Join(", ", leftovers)}");
+            if (d365Disabled.Count > 0)
+                _logger($"[AxDB] {tableName}: left disabled (not disabled by DBSyncTool): {string.Join(", ", d365Disabled)}");
+            if (keptForFk.Count > 0)
+                _logger($"[AxDB] {tableName}: kept enabled (referenced by a foreign key): {string.Join(", ", keptForFk)}");
+
+            foreach (var name in staleMarkers)
+            {
+                _logger($"[AxDB] {tableName}: removing stale marker from enabled index {name}");
+                await ExecuteNonQueryAsync(StreamIndexSql.DropMarker(tableName, name), connection, null, cancellationToken, TriggerCommandTimeoutSeconds);
+            }
+
+            string stamp = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ");
+            foreach (var index in candidates)
+            {
+                // Marker first: from here on the index is ours, even if the process dies
+                await ExecuteNonQueryAsync(StreamIndexSql.AddMarker(tableName, index.Name, stamp), connection, null, cancellationToken, TriggerCommandTimeoutSeconds);
+                toRebuild.Add(index);
+                await ExecuteNonQueryAsync(StreamIndexSql.Disable(tableName, index.Name), connection, null, cancellationToken, TriggerCommandTimeoutSeconds);
+                result.IndexesDisabled++;
+            }
+
+            sw.Stop();
+            result.IndexesPreDisabled = leftovers.Count;
+            result.IndexesLeftDisabled = d365Disabled.Count;
+            result.IndexesKeptForForeignKeys = keptForFk.Count;
+            result.DisableSeconds = sw.Elapsed.TotalSeconds;
+            _logger($"[AxDB] {tableName}: disabled {result.IndexesDisabled} nonclustered index(es) for the load in {sw.Elapsed.TotalSeconds:F2}s " +
+                    $"(marker {StreamIndexSql.MarkerName} + ALTER INDEX ... DISABLE; rebuilt after the load)");
+        }
+
+        /// <summary>
+        /// Workaround for a SQL Server 2019 bug: SqlBulkCopy into a table that has an enabled
+        /// nonclustered columnstore index AND an enabled nonclustered rowstore index containing a
+        /// rowversion column (D365's SYSROWVERSION indexes) fails with assertion 3624 and kills
+        /// the session. Called right before every bulk copy into an AxDB table; for such a table
+        /// each enabled columnstore index first gets the DBSyncTool marker, then ALTER INDEX ...
+        /// DISABLE (cheap: rebuilding a columnstore index of 500,000 rows takes seconds). Like the
+        /// STREAM route's rowstore indexes: disabled WITH the marker = leftover of an interrupted
+        /// run → rebuilt too; disabled WITHOUT it = D365's own → never touched; a stale marker on
+        /// an enabled index is dropped. <paramref name="toRebuild"/> is filled as it goes; the
+        /// caller rebuilds it in every outcome (<see cref="RebuildIndexesAsync"/>).
+        /// </summary>
+        private async Task DisableColumnstoreForBulkLoadAsync(string tableName, SqlConnection connection,
+            List<StreamIndex> toRebuild, CancellationToken cancellationToken, SqlTransaction? transaction = null)
+        {
+            var toDisable = new List<string>();
+            var staleMarkers = new List<string>();
+            var leftovers = new List<string>();
+
+            using (var command = new SqlCommand(StreamIndexSql.ListColumnstoreSql, connection, transaction))
+            {
+                command.Parameters.AddWithValue("@Table", StreamIndexSql.QualifiedTable(tableName));
+                command.CommandTimeout = TriggerCommandTimeoutSeconds;
+                using var reader = await command.ExecuteReaderAsync(cancellationToken);
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    string name = reader.GetString(0);
+                    bool disabled = reader.GetBoolean(1);
+                    bool marked = reader.GetInt32(2) == 1;
+                    bool rowversionIndexEnabled = reader.GetInt32(3) == 1;
+
+                    if (disabled && marked)
+                        leftovers.Add(name);
+                    else if (!disabled)
+                    {
+                        if (marked)
+                            staleMarkers.Add(name);
+                        if (rowversionIndexEnabled)
+                            toDisable.Add(name);
+                    }
+                    // disabled without the marker: disabled by D365 - never touched
+                }
+            }
+
+            if (leftovers.Count == 0 && toDisable.Count == 0 && staleMarkers.Count == 0)
+                return;
+
+            foreach (var name in leftovers)
+                toRebuild.Add(new StreamIndex(name, false, ""));
+            if (leftovers.Count > 0)
+                _logger($"[AxDB] {tableName}: columnstore index(es) still disabled by an interrupted DBSyncTool run (marker {StreamIndexSql.MarkerName}) - rebuilt after the load: {string.Join(", ", leftovers)}");
+
+            foreach (var name in staleMarkers)
+            {
+                _logger($"[AxDB] {tableName}: removing stale marker from enabled columnstore index {name}");
+                await ExecuteNonQueryAsync(StreamIndexSql.DropMarker(tableName, name), connection, transaction, cancellationToken, TriggerCommandTimeoutSeconds);
+            }
+
+            string stamp = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ");
+            foreach (var name in toDisable)
+            {
+                // Marker first: from here on the index is ours, even if the process dies
+                await ExecuteNonQueryAsync(StreamIndexSql.AddMarker(tableName, name, stamp), connection, transaction, cancellationToken, TriggerCommandTimeoutSeconds);
+                toRebuild.Add(new StreamIndex(name, false, ""));
+                await ExecuteNonQueryAsync(StreamIndexSql.Disable(tableName, name), connection, transaction, cancellationToken, TriggerCommandTimeoutSeconds);
+            }
+            if (toDisable.Count > 0)
+                _logger($"[AxDB] {tableName}: columnstore index(es) disabled for the bulk insert, rebuilt afterwards: {string.Join(", ", toDisable)} " +
+                        "(SQL Server bug: bulk insert into a table with a nonclustered columnstore index and a SYSROWVERSION index fails with error 3624)");
+        }
+
+        /// <summary>
+        /// <see cref="DisableColumnstoreForBulkLoadAsync"/> for the INCREMENTAL route, whose deletes
+        /// and bulk insert run in ONE transaction: marker and DISABLE are part of that transaction,
+        /// so a rollback (also the one SQL Server does when the bug kills the session) re-enables
+        /// the index by itself. Returns the indexes to pass to
+        /// <see cref="RebuildColumnstoreInTransactionAsync"/> after the bulk insert.
+        /// </summary>
+        public async Task<List<string>> DisableColumnstoreInTransactionAsync(string tableName, SqlConnection connection,
+            SqlTransaction transaction, CancellationToken cancellationToken)
+        {
+            var toRebuild = new List<StreamIndex>();
+            await DisableColumnstoreForBulkLoadAsync(tableName, connection, toRebuild, cancellationToken, transaction);
+            return toRebuild.Select(i => i.Name).ToList();
+        }
+
+        /// <summary>
+        /// Rebuilds the columnstore indexes of <see cref="DisableColumnstoreInTransactionAsync"/>
+        /// inside the same transaction and drops their markers. An error propagates - the caller
+        /// rolls back, which also undoes the DISABLE.
+        /// </summary>
+        public async Task RebuildColumnstoreInTransactionAsync(string tableName, IReadOnlyCollection<string> indexNames,
+            SqlConnection connection, SqlTransaction transaction)
+        {
+            if (indexNames.Count == 0)
+                return;
+
+            var sw = Stopwatch.StartNew();
+            foreach (var name in indexNames)
+            {
+                var indexSw = Stopwatch.StartNew();
+                string sql = StreamIndexSql.Rebuild(tableName, name);
+                await ExecuteNonQueryAsync(sql, connection, transaction, CancellationToken.None, StreamIndexSql.RebuildCommandTimeoutSeconds);
+                _logger($"[AxDB SQL] {sql}   ({indexSw.Elapsed.TotalSeconds:F2}s)");
+                await ExecuteNonQueryAsync(StreamIndexSql.DropMarker(tableName, name), connection, transaction, CancellationToken.None, TriggerCommandTimeoutSeconds);
+            }
+            _logger($"[AxDB] {tableName}: rebuilt {indexNames.Count} columnstore index(es) in {sw.Elapsed.TotalSeconds:F2}s");
+        }
+
+        /// <summary>
+        /// Rebuilds the columnstore indexes <see cref="DisableColumnstoreForBulkLoadAsync"/>
+        /// disabled, after a FAILED or cancelled in-memory bulk insert: on a fresh connection (the
+        /// bug kills the session; a cancelled bulk copy can leave the connection unusable), without
+        /// the cancellation token. Never throws - the original error stays what the table reports;
+        /// an index that still fails keeps its marker and is rebuilt by the next load of the table.
+        /// </summary>
+        private async Task RebuildColumnstoreAfterFailureAsync(string tableName, List<StreamIndex> toRebuild)
+        {
+            if (toRebuild.Count == 0)
+                return;
+
+            _logger($"[AxDB] {tableName}: rebuilding {toRebuild.Count} disabled columnstore index(es) after cancel/failure");
+            try
+            {
+                using var fresh = new SqlConnection(_connectionString);
+                await fresh.OpenAsync(CancellationToken.None);
+                await RebuildIndexesAsync(tableName, toRebuild, fresh, new StreamInsertResult());
+            }
+            catch (Exception ex)
+            {
+                _logger($"[AxDB] ERROR: {tableName}: columnstore index rebuild after the failure failed ({ex.Message}) - run: " +
+                        string.Join(" ; ", toRebuild.Select(i => StreamIndexSql.Rebuild(tableName, i.Name))));
+            }
+            toRebuild.Clear();
+        }
+
+        /// <summary>
+        /// ALTER TABLE ... ENABLE TRIGGER ALL without the cancellation token, on
+        /// <paramref name="connection"/> or - when a fatal error closed that session - on a fresh one.
+        /// </summary>
+        private async Task EnableTriggersAfterFailureAsync(string tableName, SqlConnection connection)
+        {
+            string sql = $"ALTER TABLE [{tableName}] ENABLE TRIGGER ALL";
+            if (connection.State == ConnectionState.Open)
+            {
+                await ExecuteNonQueryAsync(sql, connection, null, CancellationToken.None, TriggerCommandTimeoutSeconds);
+                return;
+            }
+
+            using var fresh = new SqlConnection(_connectionString);
+            await fresh.OpenAsync(CancellationToken.None);
+            await ExecuteNonQueryAsync(sql, fresh, null, CancellationToken.None, TriggerCommandTimeoutSeconds);
+        }
+
+        /// <summary>
+        /// ALTER INDEX ... REBUILD for each index, one after the other, without the cancellation
+        /// token (generous timeout), then its DBSyncTool marker is dropped (kept when the rebuild
+        /// fails, so the next STREAM run rebuilds it). A connection lost on the way is replaced and the index
+        /// retried once; any other error is collected (message names the index and the fix SQL)
+        /// and the remaining indexes are still rebuilt.
+        /// </summary>
+        private async Task<List<string>> RebuildIndexesAsync(string tableName, List<StreamIndex> indexes,
+            SqlConnection connection, StreamInsertResult result)
+        {
+            var failures = new List<string>();
+            var sw = Stopwatch.StartNew();
+            var current = connection;
+            SqlConnection? replacement = null;
+
+            try
+            {
+                foreach (var index in indexes)
+                {
+                    string sql = StreamIndexSql.Rebuild(tableName, index.Name);
+                    for (int attempt = 1; ; attempt++)
+                    {
+                        var indexSw = Stopwatch.StartNew();
+                        try
+                        {
+                            await ExecuteNonQueryAsync(sql, current, null, CancellationToken.None, StreamIndexSql.RebuildCommandTimeoutSeconds);
+                            result.IndexesRebuilt++;
+                            _logger($"[AxDB SQL] {sql}   ({indexSw.Elapsed.TotalSeconds:F2}s)");
+                            try
+                            {
+                                await ExecuteNonQueryAsync(StreamIndexSql.DropMarker(tableName, index.Name), current, null, CancellationToken.None, TriggerCommandTimeoutSeconds);
+                            }
+                            catch (Exception markerEx)
+                            {
+                                // Harmless: the index is enabled; the next STREAM run removes the stale marker
+                                _logger($"[AxDB] WARNING: {tableName}: index {index.Name} rebuilt, but its marker could not be removed: {markerEx.Message}");
+                            }
+                            break;
+                        }
+                        catch (Exception ex) when (attempt == 1 && current.State != ConnectionState.Open)
+                        {
+                            _logger($"[AxDB] {tableName}: connection lost during index rebuild ({ex.Message}) - retrying on a new connection");
+                            replacement?.Dispose();
+                            replacement = new SqlConnection(_connectionString);
+                            await replacement.OpenAsync(CancellationToken.None);
+                            current = replacement;
+                        }
+                        catch (Exception ex)
+                        {
+                            string fix = index.IsUnique && !string.IsNullOrEmpty(index.KeyColumns)
+                                ? $"find the duplicates with: {StreamIndexSql.DuplicateCheck(tableName, index.KeyColumns)} ; remove them, then run: {sql}"
+                                : $"fix the cause, then run: {sql}";
+                            string message = $"Index {StreamIndexSql.Quote(index.Name)} on {tableName} could not be rebuilt after the load and stays DISABLED " +
+                                             $"({(ex is SqlException se ? $"SqlException {se.Number}: " : "")}{ex.Message.Trim()}) - {fix}";
+                            failures.Add(message);
+                            _logger($"[AxDB] ERROR: {message}");
+                            break;
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                replacement?.Dispose();
+            }
+
+            sw.Stop();
+            result.RebuildSeconds = sw.Elapsed.TotalSeconds;
+            _logger($"[AxDB] {tableName}: rebuilt {result.IndexesRebuilt} of {indexes.Count} nonclustered index(es) in {sw.Elapsed.TotalSeconds:F2}s" +
+                    (failures.Count > 0 ? $" - {failures.Count} FAILED" : ""));
+            return failures;
+        }
+
+        /// <summary>Counts of a KEEP route upsert (see <see cref="UpsertKeepExistingAsync"/>).</summary>
+        public sealed class KeepUpsertResult
+        {
+            public int Fetched { get; set; }
+            public int SkippedConflicts { get; set; }
+            public int Updated { get; set; }      // existing AxDB RecIds replaced with the Tier2 row
+            public int InsertedNew { get; set; }  // RecIds that did not exist in AxDB
+        }
+
+        /// <summary>
+        /// KEEP route (-keep): upserts the fetched rows by RecId in ONE transaction and never
+        /// deletes or truncates any other AxDB row.
+        ///  1. bulk copy the fetched rows into #keep (insertable columns only - no rowversion)
+        ///  2. per unique index (other than RecId): drop #keep rows whose key belongs to a
+        ///     different local row that stays - logged as "skipped: conflicts with local row"
+        ///  3. DELETE the AxDB rows whose RecId is in #keep, INSERT all #keep rows
+        ///  4. sequence update; triggers disabled around the DML
+        /// SQL text comes from <see cref="KeepModeSql"/> (shared with Get SQL).
+        /// </summary>
+        public async Task<KeepUpsertResult> UpsertKeepExistingAsync(TableInfo tableInfo, CancellationToken cancellationToken)
+        {
+            string table = tableInfo.TableName;
+            var data = tableInfo.CachedData;
+            var result = new KeepUpsertResult { Fetched = data?.Rows.Count ?? 0 };
+
+            if (data == null || data.Rows.Count == 0)
+            {
+                _logger($"[KEEP] {table}: nothing fetched - AxDB not touched");
+                tableInfo.DeleteTimeSeconds = 0;
+                tableInfo.InsertTimeSeconds = 0;
+                return result;
+            }
+
+            using var connection = new SqlConnection(_connectionString);
+            await connection.OpenAsync(cancellationToken);
+
+            // Metadata: insertable columns and unique indexes of the AxDB table
+            string objectName = $"[dbo].[{table}]";
+            var nonInsertable = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            using (var cmd = new SqlCommand(KeepModeSql.NonInsertableColumnsQuery, connection))
+            {
+                cmd.Parameters.Add("@ObjectName", SqlDbType.NVarChar, 300).Value = objectName;
+                cmd.CommandTimeout = _connectionSettings.CommandTimeout;
+                using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+                while (await reader.ReadAsync(cancellationToken))
+                    nonInsertable.Add(reader.GetString(0));
+            }
+
+            var columns = data.Columns.Cast<DataColumn>()
+                .Select(c => c.ColumnName)
+                .Where(c => !nonInsertable.Contains(c))
+                .ToList();
+            if (!columns.Any(c => c.Equals("RECID", StringComparison.OrdinalIgnoreCase)))
+                throw new Exception($"{table}: -keep needs a RECID column in the fetched data");
+
+            var indexColumns = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+            var filteredIndexes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            using (var cmd = new SqlCommand(KeepModeSql.UniqueIndexesQuery, connection))
+            {
+                cmd.Parameters.Add("@ObjectName", SqlDbType.NVarChar, 300).Value = objectName;
+                cmd.CommandTimeout = _connectionSettings.CommandTimeout;
+                using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    string indexName = reader.GetString(0);
+                    if (!indexColumns.TryGetValue(indexName, out var list))
+                        indexColumns[indexName] = list = new List<string>();
+                    list.Add(reader.GetString(1));
+                    if (reader.GetBoolean(2))
+                        filteredIndexes.Add(indexName);
+                }
+            }
+
+            var columnSet = new HashSet<string>(columns, StringComparer.OrdinalIgnoreCase);
+            var checks = new List<(string Name, List<string> Keys)>();
+            foreach (var (indexName, keys) in indexColumns)
+            {
+                // An index containing RecId can never be violated by a different RecId
+                if (keys.Any(k => k.Equals("RECID", StringComparison.OrdinalIgnoreCase)))
+                    continue;
+                if (filteredIndexes.Contains(indexName))
+                {
+                    _logger($"[KEEP] {table}: WARNING - filtered unique index {indexName} is not checked for conflicts");
+                    continue;
+                }
+                var missing = keys.Where(k => !columnSet.Contains(k)).ToList();
+                if (missing.Count > 0)
+                {
+                    _logger($"[KEEP] {table}: WARNING - unique index {indexName} not checked, key column(s) not copied: {string.Join(", ", missing)}");
+                    continue;
+                }
+                checks.Add((indexName, keys));
+            }
+            _logger($"[KEEP] {table}: {columns.Count} column(s) upserted" +
+                    (nonInsertable.Count > 0 ? $" (not inserted, generated by SQL Server: {string.Join(", ", nonInsertable)})" : "") +
+                    $"; unique key checks: {(checks.Count > 0 ? string.Join(", ", checks.Select(c => $"{c.Name}({string.Join(",", c.Keys)})")) : "none")}");
+
+            string disableTriggersSql = $"ALTER TABLE [{table}] DISABLE TRIGGER ALL";
+            string enableTriggersSql = $"ALTER TABLE [{table}] ENABLE TRIGGER ALL";
+            using var transaction = connection.BeginTransaction();
+
+            try
+            {
+                _logger($"[AxDB SQL] {disableTriggersSql}");
+                await ExecuteNonQueryAsync(disableTriggersSql, connection, transaction, cancellationToken, TriggerCommandTimeoutSeconds);
+
+                // Step 1: fetched rows → #keep
+                var deleteStopwatch = Stopwatch.StartNew();
+                string createSql = KeepModeSql.CreateTempTable(table, columns);
+                _logger($"[AxDB SQL] {createSql}");
+                await ExecuteNonQueryAsync(createSql, connection, transaction, cancellationToken);
+
+                using (var bulkCopy = new SqlBulkCopy(connection, SqlBulkCopyOptions.Default, transaction))
+                {
+                    bulkCopy.DestinationTableName = KeepModeSql.TempTable;
+                    bulkCopy.BatchSize = 10000;
+                    bulkCopy.BulkCopyTimeout = _connectionSettings.CommandTimeout;
+                    foreach (var column in columns)
+                        bulkCopy.ColumnMappings.Add(column, column);
+                    await bulkCopy.WriteToServerAsync(data, cancellationToken);
+                }
+                await ExecuteNonQueryAsync(KeepModeSql.IndexTempTable(), connection, transaction, cancellationToken);
+
+                // Step 2: unique key conflicts with local rows that stay
+                var samples = new List<string>();
+                var perIndex = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                for (int pass = 1; pass <= KeepModeSql.MaxConflictPasses; pass++)
+                {
+                    int removedThisPass = 0;
+                    foreach (var (indexName, keys) in checks)
+                    {
+                        if (samples.Count < KeepModeSql.ConflictSampleSize)
+                        {
+                            using var sampleCmd = new SqlCommand(
+                                KeepModeSql.SelectConflicts(table, keys, KeepModeSql.ConflictSampleSize - samples.Count),
+                                connection, transaction);
+                            sampleCmd.CommandTimeout = _connectionSettings.CommandTimeout;
+                            using var reader = await sampleCmd.ExecuteReaderAsync(cancellationToken);
+                            while (await reader.ReadAsync(cancellationToken))
+                            {
+                                var keyText = string.Join(", ", keys.Select((k, i) => $"{k}={reader.GetValue(2 + i)}"));
+                                samples.Add($"RecId {reader.GetInt64(0)} vs local RecId {reader.GetInt64(1)} on {indexName} ({keyText})");
+                            }
+                        }
+
+                        string deleteConflictsSql = KeepModeSql.DeleteConflicts(table, keys);
+                        if (pass == 1)
+                            _logger($"[AxDB SQL] {deleteConflictsSql}");
+                        using var deleteCmd = new SqlCommand(deleteConflictsSql, connection, transaction);
+                        deleteCmd.CommandTimeout = _connectionSettings.CommandTimeout;
+                        int removed = await deleteCmd.ExecuteNonQueryAsync(cancellationToken);
+                        if (removed > 0)
+                        {
+                            perIndex[indexName] = perIndex.GetValueOrDefault(indexName) + removed;
+                            removedThisPass += removed;
+                        }
+                    }
+                    result.SkippedConflicts += removedThisPass;
+                    if (removedThisPass == 0)
+                        break;
+                }
+
+                if (result.SkippedConflicts > 0)
+                {
+                    _logger($"[KEEP] {table}: {result.SkippedConflicts} fetched row(s) skipped: conflicts with local row " +
+                            $"({string.Join(", ", perIndex.Select(p => $"{p.Key}: {p.Value}"))})");
+                    foreach (var sample in samples)
+                        _logger($"[KEEP] {table}:   skipped {sample}");
+                    if (result.SkippedConflicts > samples.Count)
+                        _logger($"[KEEP] {table}:   ... {result.SkippedConflicts - samples.Count} more not listed");
+                }
+
+                // Step 3: replace the AxDB rows with the same RecId - nothing else is deleted
+                string deleteReplacedSql = KeepModeSql.DeleteReplaced(table);
+                _logger($"[AxDB SQL] {deleteReplacedSql}");
+                using (var cmd = new SqlCommand(deleteReplacedSql, connection, transaction))
+                {
+                    cmd.CommandTimeout = _connectionSettings.CommandTimeout;
+                    result.Updated = await cmd.ExecuteNonQueryAsync(cancellationToken);
+                }
+                deleteStopwatch.Stop();
+                tableInfo.DeleteTimeSeconds = (decimal)deleteStopwatch.Elapsed.TotalSeconds;
+
+                var insertStopwatch = Stopwatch.StartNew();
+                string insertSql = KeepModeSql.Insert(table, columns);
+                _logger($"[AxDB SQL] {insertSql}");
+                int inserted;
+                using (var cmd = new SqlCommand(insertSql, connection, transaction))
+                {
+                    cmd.CommandTimeout = _connectionSettings.CommandTimeout;
+                    inserted = await cmd.ExecuteNonQueryAsync(cancellationToken);
+                }
+                result.InsertedNew = inserted - result.Updated;
+
+                await ExecuteNonQueryAsync(KeepModeSql.DropTempTable(), connection, transaction, cancellationToken);
+
+                _logger($"[AxDB SQL] {enableTriggersSql}");
+                await ExecuteNonQueryAsync(enableTriggersSql, connection, transaction, cancellationToken, TriggerCommandTimeoutSeconds);
+
+                // Step 4: sequence
+                await UpdateSequenceAsync(tableInfo, connection, transaction, cancellationToken);
+
+                transaction.Commit();
+                insertStopwatch.Stop();
+                tableInfo.InsertTimeSeconds = (decimal)insertStopwatch.Elapsed.TotalSeconds;
+
+                return result;
+            }
+            catch
+            {
+                // Rollback also undoes the DISABLE TRIGGER; enable again anyway (best effort)
+                try { transaction.Rollback(); } catch { /* connection may be gone */ }
+                try
+                {
+                    await ExecuteNonQueryAsync(enableTriggersSql, connection, null, CancellationToken.None, TriggerCommandTimeoutSeconds);
+                }
+                catch
+                {
+                    // Ignore errors when re-enabling triggers
+                }
+                throw;
             }
         }
 
@@ -193,6 +911,7 @@ namespace DBSyncTool.Services
             await connection.OpenAsync(cancellationToken);
 
             DataTable? filteredDataToDispose = null;  // Track filtered DataTable for disposal - declared outside try for catch block access
+            var columnstoreToRebuild = new List<StreamIndex>();  // disabled for the bulk insert (SQL Server bug), rebuilt in every outcome
 
             try
             {
@@ -347,6 +1066,8 @@ namespace DBSyncTool.Services
 
                 if (dataToInsert.Rows.Count > 0)
                 {
+                    await DisableColumnstoreForBulkLoadAsync(tableInfo.TableName, connection, columnstoreToRebuild, cancellationToken);
+
                     using (var bulkCopy = new SqlBulkCopy(connection))
                     {
                         bulkCopy.DestinationTableName = tableInfo.TableName;
@@ -360,6 +1081,14 @@ namespace DBSyncTool.Services
                         }
 
                         await bulkCopy.WriteToServerAsync(dataToInsert, cancellationToken);
+                    }
+
+                    if (columnstoreToRebuild.Count > 0)
+                    {
+                        var rebuildFailures = await RebuildIndexesAsync(tableInfo.TableName, columnstoreToRebuild, connection, new StreamInsertResult());
+                        columnstoreToRebuild.Clear();
+                        if (rebuildFailures.Count > 0)
+                            throw new IndexRebuildException(string.Join(" | ", rebuildFailures), null);
                     }
                 }
 
@@ -383,13 +1112,15 @@ namespace DBSyncTool.Services
             }
             catch
             {
+                await RebuildColumnstoreAfterFailureAsync(tableInfo.TableName, columnstoreToRebuild);
+
                 // Always try to re-enable triggers on error. Use CancellationToken.None so this
                 // still runs when the operation was cancelled, but keep a finite timeout so it
-                // cannot hang the worker.
+                // cannot hang the worker. A fatal error (e.g. the columnstore bug) closes the
+                // session - then a fresh connection is used.
                 try
                 {
-                    await ExecuteNonQueryAsync($"ALTER TABLE [{tableInfo.TableName}] ENABLE TRIGGER ALL", connection, null,
-                        CancellationToken.None, TriggerCommandTimeoutSeconds);
+                    await EnableTriggersAfterFailureAsync(tableInfo.TableName, connection);
                 }
                 catch
                 {
@@ -610,6 +1341,153 @@ namespace DBSyncTool.Services
             _logger($"[AxDB] Loaded SQLDICTIONARY cache: {cache.GetStats()}");
 
             return cache;
+        }
+
+        /// <summary>
+        /// Loads the TableGroup of every table from the AxDB TABLEMETADATATABLE, keyed by SQL
+        /// table name (case-insensitive). Used to resolve "TableGroup:..." lines in the
+        /// Tables to Copy / Tables to Exclude lists.
+        /// </summary>
+        public async Task<Dictionary<string, int>> GetTableGroupsAsync()
+        {
+            const string query = @"
+                SELECT d.SQLNAME, m.TABLEGROUP
+                FROM SQLDICTIONARY d
+                INNER JOIN TABLEMETADATATABLE m ON m.TABLEID = d.TABLEID
+                WHERE d.FIELDID = 0 AND d.ARRAY = 0";
+
+            _logger("[AxDB] Loading table groups (SQLDICTIONARY + TABLEMETADATATABLE)...");
+
+            var result = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+            using var connection = new SqlConnection(_connectionString);
+            using var command = new SqlCommand(query, connection);
+            command.CommandTimeout = _connectionSettings.CommandTimeout;
+
+            await connection.OpenAsync();
+            using var reader = await command.ExecuteReaderAsync();
+
+            while (await reader.ReadAsync())
+            {
+                if (reader.IsDBNull(0) || reader.IsDBNull(1))
+                    continue;
+                result[reader.GetString(0)] = Convert.ToInt32(reader.GetValue(1));
+            }
+
+            _logger($"[AxDB] Loaded table groups for {result.Count} tables");
+            return result;
+        }
+
+        /// <summary>
+        /// Tables (dbo base tables in AxDB) whose SQLDICTIONARY entry has an item or product key
+        /// column, with their TableGroup and which key/company columns they have.
+        /// </summary>
+        public async Task<List<ItemTableCandidate>> GetItemTableCandidatesAsync(IReadOnlyDictionary<string, string>? itemRelations = null)
+        {
+            // Names come from code constants and the [TransactionLessItemRelations] ini lines -
+            // quote them safely, since the ini is user-edited.
+            static string Quote(string v) => "N'" + v.Replace("'", "''") + "'";
+
+            var columns = TransactionLessHelper.KeyColumns
+                .Concat(TransactionLessHelper.CompanyColumns)
+                .Concat(TransactionLessHelper.RelationTables.Values.Select(r => r.Column))
+                .Concat(itemRelations?.Values ?? Enumerable.Empty<string>())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            string allColumns = string.Join(", ", columns.Select(c => Quote(c.ToUpperInvariant())));
+            string keyColumns = string.Join(", ", TransactionLessHelper.KeyColumns.Select(Quote));
+            string relationTables = string.Join(", ", TransactionLessHelper.RelationTables.Keys
+                .Concat(itemRelations?.Keys ?? Enumerable.Empty<string>())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Select(t => Quote(t.ToUpperInvariant())));
+
+            // Data type per column: an INVENTTABLE column is a RecId (bigint) on some tables and an
+            // ItemId (nvarchar) on others, and the filter differs.
+            string query = $@"
+                SELECT t.SQLNAME, m.TABLEGROUP, f.SQLNAME, ISNULL(TYPE_NAME(c.system_type_id), '')
+                FROM SQLDICTIONARY t
+                INNER JOIN TABLEMETADATATABLE m ON m.TABLEID = t.TABLEID
+                INNER JOIN SQLDICTIONARY f ON f.TABLEID = t.TABLEID AND f.FIELDID <> 0
+                LEFT JOIN sys.columns c ON c.object_id = OBJECT_ID(N'dbo.' + QUOTENAME(t.SQLNAME)) AND c.name = f.SQLNAME
+                WHERE t.FIELDID = 0 AND t.ARRAY = 0
+                  AND UPPER(f.SQLNAME) IN ({allColumns})
+                  AND (EXISTS (SELECT 1 FROM SQLDICTIONARY k
+                               WHERE k.TABLEID = t.TABLEID AND k.FIELDID <> 0 AND UPPER(k.SQLNAME) IN ({keyColumns}))
+                       OR UPPER(t.SQLNAME) IN ({relationTables}))
+                  AND EXISTS (SELECT 1 FROM sys.tables st
+                              WHERE st.name = t.SQLNAME AND st.schema_id = SCHEMA_ID('dbo'))";
+
+            _logger("[AxDB] Loading item/product tables from SQLDICTIONARY...");
+
+            var map = new Dictionary<string, ItemTableCandidate>(StringComparer.OrdinalIgnoreCase);
+
+            using var connection = new SqlConnection(_connectionString);
+            using var command = new SqlCommand(query, connection);
+            command.CommandTimeout = _connectionSettings.CommandTimeout;
+
+            await connection.OpenAsync();
+            using var reader = await command.ExecuteReaderAsync();
+
+            while (await reader.ReadAsync())
+            {
+                string tableName = reader.GetString(0).ToUpperInvariant();
+                if (!map.TryGetValue(tableName, out var candidate))
+                {
+                    candidate = new ItemTableCandidate
+                    {
+                        TableName = tableName,
+                        TableGroup = Convert.ToInt32(reader.GetValue(1))
+                    };
+                    map[tableName] = candidate;
+                }
+                string column = reader.GetString(2).ToUpperInvariant();
+                candidate.Columns.Add(column);
+                candidate.ColumnTypes[column] = reader.GetString(3);
+            }
+
+            _logger($"[AxDB] Found {map.Count} tables with an item/product column");
+            return map.Values.OrderBy(c => c.TableName, StringComparer.OrdinalIgnoreCase).ToList();
+        }
+
+        /// <summary>
+        /// Columns of a table from the AxDB SQLDICTIONARY (FIELDID &lt;&gt; 0) that exist in the
+        /// dbo table, with their SQL data type from INFORMATION_SCHEMA.COLUMNS. Empty when the
+        /// table is unknown or missing.
+        /// </summary>
+        public async Task<List<TableColumnInfo>> GetTableColumnTypesAsync(string tableName)
+        {
+            const string query = @"
+                SELECT f.SQLNAME, f.FIELDID, f.ARRAY, c.DATA_TYPE
+                FROM SQLDICTIONARY t
+                INNER JOIN SQLDICTIONARY f ON f.TABLEID = t.TABLEID AND f.FIELDID <> 0
+                INNER JOIN INFORMATION_SCHEMA.COLUMNS c
+                    ON c.TABLE_SCHEMA = 'dbo' AND c.TABLE_NAME = t.SQLNAME AND c.COLUMN_NAME = f.SQLNAME
+                WHERE t.FIELDID = 0 AND t.ARRAY = 0 AND t.SQLNAME = @TableName
+                ORDER BY f.FIELDID, f.ARRAY";
+
+            _logger($"[AxDB] Loading {tableName} columns (SQLDICTIONARY + INFORMATION_SCHEMA)...");
+
+            var result = new List<TableColumnInfo>();
+
+            using var connection = new SqlConnection(_connectionString);
+            using var command = new SqlCommand(query, connection);
+            command.Parameters.Add("@TableName", SqlDbType.NVarChar, 128).Value = tableName;
+            command.CommandTimeout = _connectionSettings.CommandTimeout;
+
+            await connection.OpenAsync();
+            using var reader = await command.ExecuteReaderAsync();
+
+            while (await reader.ReadAsync())
+            {
+                result.Add(new TableColumnInfo(
+                    reader.GetString(0),
+                    Convert.ToInt32(reader.GetValue(1)),
+                    Convert.ToInt32(reader.GetValue(2)),
+                    reader.GetString(3)));
+            }
+
+            _logger($"[AxDB] Found {result.Count} columns for {tableName}");
+            return result;
         }
 
         /// <summary>
@@ -1020,6 +1898,33 @@ namespace DBSyncTool.Services
         /// <summary>
         /// Gets set of table names that have at least 1 row in AxDB (fast DMV-based query)
         /// </summary>
+        /// <summary>
+        /// Row count of every user table in AxDB (one query on sys.dm_db_partition_stats), keyed
+        /// by table name (case-insensitive). Used as the size proxy for SQL-filter estimates.
+        /// </summary>
+        public async Task<Dictionary<string, long>> GetTableRowCountsAsync(CancellationToken cancellationToken)
+        {
+            const string sql = @"
+                SELECT o.name, SUM(s.row_count)
+                FROM sys.dm_db_partition_stats s
+                INNER JOIN sys.objects o ON o.object_id = s.object_id
+                WHERE o.type = 'U' AND s.index_id IN (0, 1)
+                GROUP BY o.name";
+
+            var result = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+
+            using var connection = new SqlConnection(_connectionString);
+            using var command = new SqlCommand(sql, connection);
+            command.CommandTimeout = _connectionSettings.CommandTimeout;
+
+            await connection.OpenAsync(cancellationToken);
+            using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+                result[reader.GetString(0)] = Convert.ToInt64(reader.GetValue(1));
+
+            return result;
+        }
+
         public async Task<HashSet<string>> GetNonEmptyTableNamesAsync(CancellationToken cancellationToken)
         {
             string sql = @"

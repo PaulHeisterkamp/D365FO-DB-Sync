@@ -5,12 +5,24 @@ namespace DBSyncTool.Helpers
     public static class DefaultValuesHelper
     {
         private const string FileName = "DefaultValues.ini";
+        private const string CustomFileName = "CustomValues.ini";
         private static readonly Regex SectionHeader = new(@"^\[(.+)\]$", RegexOptions.Compiled);
 
         public static string GetDefaultFilePath()
         {
             var exeDir = AppDomain.CurrentDomain.BaseDirectory;
             return Path.Combine(exeDir, FileName);
+        }
+
+        /// <summary>
+        /// Customer/project specific values (e.g. own table names). Empty in the repository and
+        /// not part of the release package - each user fills in their own copy next to the exe.
+        /// Same format as DefaultValues.ini; lines before the first section are comments.
+        /// </summary>
+        public static string GetCustomFilePath()
+        {
+            var exeDir = AppDomain.CurrentDomain.BaseDirectory;
+            return Path.Combine(exeDir, CustomFileName);
         }
 
         public static Dictionary<string, string> ReadAllSections(string filePath)

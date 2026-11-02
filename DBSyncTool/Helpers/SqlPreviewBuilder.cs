@@ -7,14 +7,15 @@ namespace DBSyncTool.Helpers
     /// <summary>
     /// Builds the "Get SQL" preview: the operations a table will go through, without running
     /// them. Mirrors CopyOrchestrator.ProcessSingleTableAsync / ProcessTableOptimizedAsync /
-    /// ProcessTableStandardModeAsync and AxDbDataService.InsertDataAsync - keep in sync.
+    /// ProcessTableStandardModeAsync / ProcessTableStreamModeAsync and AxDbDataService.InsertDataAsync /
+    /// StreamInsertAsync - keep in sync.
     /// </summary>
     public static class SqlPreviewBuilder
     {
         /// <summary>
         /// Route a table takes in CopyOrchestrator.ProcessSingleTableAsync.
         /// </summary>
-        public enum PreviewRoute { System, Standard, Optimized }
+        public enum PreviewRoute { System, Keep, Stream, Standard, Optimized }
 
         private static bool HasCopyableField(TableInfo table, string field)
         {
@@ -28,16 +29,33 @@ namespace DBSyncTool.Helpers
         }
 
         /// <summary>
-        /// Mirrors the routing in CopyOrchestrator.ProcessSingleTableAsync (System → UseTruncate
-        /// → UseOptimizedMode → standard) plus the SQL-without-placeholder fallback inside
-        /// ProcessTableOptimizedAsync. Keep in sync with those methods.
+        /// Mirrors the routing in CopyOrchestrator.ProcessSingleTableAsync (System [large → STREAM]
+        /// → KeepExisting → STREAM → UseTruncate → UseOptimizedMode → standard) plus the
+        /// SQL-without-placeholder fallback inside ProcessTableOptimizedAsync. The STREAM decision
+        /// is StreamModeRules.ShouldStream, the same call the runtime makes. Keep in sync with
+        /// those methods.
         /// </summary>
         public static PreviewRoute GetPreviewRoute(TableInfo table, out string reason)
         {
+            bool stream = StreamModeRules.ShouldStream(table, out string streamReason);
+
             if (table.StrategyType == CopyStrategyType.System)
             {
-                reason = "table is listed on the System tab";
-                return PreviewRoute.System;
+                reason = stream ? streamReason : "table is listed on the System tab";
+                return stream ? PreviewRoute.Stream : PreviewRoute.System;
+            }
+
+            if (table.KeepExisting)
+            {
+                reason = "-keep flag: fetched rows are upserted by RecId, no other AxDB row is deleted or truncated " +
+                         "(threshold, Force truncate mode and saved AxDB timestamp do not apply)";
+                return PreviewRoute.Keep;
+            }
+
+            if (stream)
+            {
+                reason = streamReason;
+                return PreviewRoute.Stream;
             }
 
             if (table.UseTruncate)
@@ -72,12 +90,40 @@ namespace DBSyncTool.Helpers
         public static string GenerateSqlForTable(TableInfo table, AppConfiguration config)
         {
             var route = GetPreviewRoute(table, out string reason);
-            return route switch
+            string preview = route switch
             {
                 PreviewRoute.System => GenerateSqlForSystemTable(table, reason, config),
+                PreviewRoute.Keep => GenerateSqlForKeepTable(table, reason, config),
+                PreviewRoute.Stream => GenerateSqlForStreamTable(table, reason, config),
                 PreviewRoute.Optimized => GenerateSqlForTableOptimized(table, reason, config),
                 _ => GenerateSqlForTableStandard(table, reason, config)
             };
+
+            // KEEP inserts with INSERT ... SELECT (not affected); every other route bulk-copies into the table
+            return route == PreviewRoute.Keep ? preview : preview + ColumnstoreGuardNote(table.TableName);
+        }
+
+        /// <summary>
+        /// Mirrors AxDbDataService.DisableColumnstoreForBulkLoadAsync / RebuildIndexesAsync, run
+        /// right before every SqlBulkCopy into the AxDB table.
+        /// </summary>
+        private static string ColumnstoreGuardNote(string t)
+        {
+            var sql = new System.Text.StringBuilder();
+            sql.AppendLine();
+            sql.AppendLine("-- === COLUMNSTORE GUARD (right before every SqlBulkCopy into the table above) ===");
+            sql.AppendLine("-- SQL Server bug: a bulk insert into a table with a nonclustered columnstore index AND an enabled");
+            sql.AppendLine("-- nonclustered index containing SYSROWVERSION fails with error 3624 and kills the session.");
+            sql.AppendLine(StreamIndexSql.ListColumnstoreSql.Replace("@Table", $"N'{StreamIndexSql.QualifiedTable(t)}'"));
+            sql.AppendLine("-- enabled + rowversion_index_enabled = 1 → marked, disabled for the bulk insert, rebuilt afterwards:");
+            sql.AppendLine(StreamIndexSql.AddMarker(t, "<columnstore index>", "<UTC time>"));
+            sql.AppendLine(StreamIndexSql.Disable(t, "<columnstore index>"));
+            sql.AppendLine("-- SqlBulkCopy ...  then in EVERY outcome (on a fresh connection after a failure):");
+            sql.AppendLine(StreamIndexSql.Rebuild(t, "<columnstore index>"));
+            sql.AppendLine(StreamIndexSql.DropMarker(t, "<columnstore index>") + "   -- only after a successful rebuild");
+            sql.AppendLine($"-- disabled WITH the marker {StreamIndexSql.MarkerName} (interrupted earlier run) → rebuilt as well;");
+            sql.AppendLine("-- disabled WITHOUT it (D365's own) → never touched; no such table → nothing is done");
+            return sql.ToString();
         }
 
         private static void AppendPreviewHeader(System.Text.StringBuilder sql, TableInfo table, string mode, string reason, AppConfiguration config, bool savedTimestampsUsed)
@@ -91,7 +137,9 @@ namespace DBSyncTool.Helpers
             sql.AppendLine($"-- Mode:     {mode}");
             sql.AppendLine($"--           {reason}");
             sql.AppendLine("--");
-            sql.AppendLine($"-- Tier2 rows: {table.Tier2RowCount:N0}   Est size: {table.EstimatedSizeMB:N1} MB");
+            sql.AppendLine(table.EstimatedSizeUnknown
+                ? $"-- Tier2 rows: {table.Tier2RowCount:N0} (whole table)   Est size: unknown - SQL filter, known after the fetch"
+                : $"-- Tier2 rows: {table.Tier2RowCount:N0}   Est size: {table.EstimatedSizeMB:N1} MB");
 
             if (!isSystem)
             {
@@ -116,7 +164,9 @@ namespace DBSyncTool.Helpers
         /// </summary>
         private static string DescribeStrategy(TableInfo table, int recordCount, AppConfiguration config)
         {
-            string truncateFlag = table.UseTruncate
+            string truncateFlag = table.KeepExisting
+                ? "  -keep (upsert only, never delete)"
+                : table.UseTruncate
                 ? "  -truncate (forced TRUNCATE)"
                 : table.NoTruncate ? "  -notruncate (exempt from 'Force truncate mode')" : "";
 
@@ -174,6 +224,198 @@ namespace DBSyncTool.Helpers
 
             sql.AppendLine("-- === NOT DONE FOR SYSTEM TABLES ===");
             sql.AppendLine("-- No delta comparison, no RecId/sequence update, no saved values written");
+
+            return sql.ToString();
+        }
+
+        /// <summary>
+        /// STREAM route - mirrors CopyOrchestrator.ProcessTableStreamModeAsync,
+        /// Tier2DataService.OpenChunkedStreamReaderAsync / Tier2ChunkedReader (chunk SQL from
+        /// StreamChunkSql, shared), OpenStreamReaderAsync (not chunkable) and
+        /// AxDbDataService.StreamInsertAsync.
+        /// </summary>
+        private static string GenerateSqlForStreamTable(TableInfo table, string reason, AppConfiguration config)
+        {
+            var sql = new System.Text.StringBuilder();
+            string t = table.TableName;
+            bool isSystem = table.StrategyType == CopyStrategyType.System;
+            bool hasSysRowVersion = HasCopyableField(table, "SYSROWVERSION");
+
+            AppendPreviewHeader(sql, table, "STREAM - TRUNCATE, then the Tier2 rows are piped into SqlBulkCopy (not loaded into memory)", reason, config, false);
+
+            var plan = StreamChunkSql.Build(table);
+            if (plan.Chunked)
+            {
+                sql.AppendLine($"-- === STEP 1: READ TIER2 IN RecId CHUNKS OF {StreamChunkSql.ChunkSize:N0} ROWS (CommandBehavior.SequentialAccess) ===");
+                sql.AppendLine($"-- Source: {plan.Description}");
+                if (table.StrategyType == CopyStrategyType.Sql && HasRowVersionPlaceholder(table))
+                {
+                    sql.AppendLine("-- @sysRowVersionFilter is replaced with (1 = 1) here: the full strategy is fetched");
+                }
+                if (plan.BoundarySql != null)
+                {
+                    sql.AppendLine("-- Once, before the first chunk (result = @MinRecId):");
+                    sql.AppendLine(plan.BoundarySql);
+                }
+                sql.AppendLine("-- Per chunk, @LastRecId = RecId of the last row read (first chunk: -9223372036854775808):");
+                sql.AppendLine(plan.ChunkSql);
+                sql.AppendLine($"-- Repeated while a chunk returns {StreamChunkSql.ChunkSize:N0} rows; a shorter chunk ends the stream.");
+                sql.AppendLine("-- The first chunk is opened before AxDB is touched: a failing query leaves the AxDB table as it is.");
+                sql.AppendLine($"-- Lost Tier2 connection / killed session / Azure transient error: new connection after {StreamChunkSql.RetryDelayText()},");
+                sql.AppendLine($"-- the next chunk starts after the last RecId already handed to SqlBulkCopy (max {StreamChunkSql.MaxResumeRetries} resumes per table);");
+                sql.AppendLine("-- the AxDB bulk insert keeps running meanwhile, nothing is copied twice or skipped.");
+            }
+            else
+            {
+                sql.AppendLine("-- === STEP 1: OPEN ONE TIER2 READER (CommandBehavior.SequentialAccess) ===");
+                sql.AppendLine($"-- Not chunked: {plan.FallbackReason}; a lost Tier2 connection fails the table");
+                sql.AppendLine("-- Opened before AxDB is touched: a failing query leaves the AxDB table as it is");
+                if (table.StrategyType == CopyStrategyType.Sql && HasRowVersionPlaceholder(table))
+                {
+                    sql.AppendLine("-- @sysRowVersionFilter is replaced with (1 = 1) here: the full strategy is fetched");
+                }
+                sql.AppendLine(string.IsNullOrEmpty(table.FetchSql) ? $"SELECT * FROM [{t}]" : table.FetchSql);
+            }
+            sql.AppendLine();
+
+            sql.AppendLine("-- === STEP 2: TRUNCATE + STREAMED INSERT (AxDB, no transaction - every 10,000-row batch commits) ===");
+            sql.AppendLine($"ALTER TABLE [{t}] DISABLE TRIGGER ALL");
+            sql.AppendLine($"TRUNCATE TABLE [{t}]                             -- falls back to DELETE FROM [{t}] if referenced by FK/view");
+            sql.AppendLine();
+            sql.AppendLine("-- Nonclustered indexes of the now empty table (names are only known at runtime):");
+            sql.AppendLine(StreamIndexSql.ListIndexesSql.Replace("@Table", $"N'{StreamIndexSql.QualifiedTable(t)}'"));
+            sql.AppendLine("-- enabled and not referenced by a foreign key → marked, then disabled for the load (FK-referenced ones stay enabled):");
+            sql.AppendLine(StreamIndexSql.AddMarker(t, "<index>", "<UTC time>"));
+            sql.AppendLine(StreamIndexSql.Disable(t, "<index>"));
+            sql.AppendLine($"-- disabled WITH the marker {StreamIndexSql.MarkerName} (interrupted earlier run) → rebuilt below as well");
+            sql.AppendLine("-- disabled WITHOUT the marker (disabled by D365: configuration keys, index tuning) → never touched");
+            sql.AppendLine("-- enabled WITH a stale marker → the marker is dropped first");
+            sql.AppendLine();
+            sql.AppendLine("-- SqlBulkCopy (TableLock, batch size 10,000, timeout 0) reads the Tier2 rows one at a time;");
+            sql.AppendLine($"-- progress is logged every {StreamModeRules.ProgressEveryRows:N0} rows. Row count, MIN/MAX(RecId) and MAX(SysRowVersion)");
+            sql.AppendLine("-- are tracked while the rows pass. Tier2 returns 0 rows → the AxDB table stays empty");
+            sql.AppendLine();
+            sql.AppendLine("-- In EVERY outcome (success, AxDB/Tier2 error, Stop - without the cancellation token, on a fresh");
+            sql.AppendLine("-- connection if the bulk copy broke the old one), one index after the other:");
+            sql.AppendLine(StreamIndexSql.Rebuild(t, "<index>") + "   -- each index disabled above (or found disabled with the marker)");
+            sql.AppendLine(StreamIndexSql.DropMarker(t, "<index>") + "   -- only after a successful rebuild");
+            sql.AppendLine("-- A failed rebuild (e.g. duplicates for a unique index) → InsertError naming the index, the duplicate");
+            sql.AppendLine("-- check and the REBUILD statement to run; its marker stays, so the next STREAM run rebuilds it;");
+            sql.AppendLine("-- the other indexes are still rebuilt");
+            sql.AppendLine($"ALTER TABLE [{t}] ENABLE TRIGGER ALL             -- always re-enabled, also on error");
+            sql.AppendLine("-- On error the table may be partially filled (FetchError / InsertError); the retry starts with the TRUNCATE again");
+            sql.AppendLine();
+
+            if (isSystem)
+            {
+                sql.AppendLine("-- === NOT DONE FOR SYSTEM TABLES ===");
+                sql.AppendLine("-- No delta comparison, no RecId/sequence update, no saved values written");
+                return sql.ToString();
+            }
+
+            AppendSequenceUpdate(sql, table, "-- === STEP 3: SEQUENCE UPDATE (AxDB) ===");
+            sql.AppendLine();
+
+            sql.AppendLine("-- === STEP 4: SAVED VALUES ===");
+            if (hasSysRowVersion)
+            {
+                sql.AppendLine("-- Tier2 timestamp = MAX(SysRowVersion) of the streamed rows");
+                sql.AppendLine($"SELECT MAX(SysRowVersion) FROM [{t}]             -- AxDB timestamp");
+                sql.AppendLine("-- Both are saved to the config, so the next run uses OPTIMIZED mode (and no longer streams");
+                sql.AppendLine("-- unless -truncate / Force truncate mode is set)");
+            }
+            else
+            {
+                sql.AppendLine("-- No SysRowVersion: MAX(RecId) of the streamed rows is saved as MaxRecId");
+            }
+            sql.AppendLine();
+
+            sql.AppendLine("-- === NOT DONE FOR STREAM ===");
+            sql.AppendLine("-- No smart TRUNCATE detection and no delta comparison: the AxDB table ends equal to the fetched");
+            sql.AppendLine("-- set, which is what the in-memory route would produce for this table as well");
+
+            return sql.ToString();
+        }
+
+        /// <summary>
+        /// KEEP route - mirrors CopyOrchestrator.ProcessTableKeepModeAsync and
+        /// AxDbDataService.UpsertKeepExistingAsync (statements from KeepModeSql).
+        /// </summary>
+        private static string GenerateSqlForKeepTable(TableInfo table, string reason, AppConfiguration config)
+        {
+            var sql = new System.Text.StringBuilder();
+            string t = table.TableName;
+            int recordCount = table.RecIdCount ?? config.DefaultRecordCount;
+            bool incremental = KeepModeSql.UsesIncrementalFetch(table);
+            bool hasSysRowVersion = HasCopyableField(table, "SYSROWVERSION");
+            // Runtime removes rowversion/computed columns read from sys.columns; in D365 that is SYSROWVERSION
+            var insertColumns = table.CopyableFields
+                .Where(f => !f.Equals("SYSROWVERSION", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            var keyExample = new[] { "<key column 1>", "<key column 2>" };
+
+            AppendPreviewHeader(sql, table, "KEEP - upsert the fetched rows by RecId, never delete anything else", reason, config, incremental);
+
+            sql.AppendLine("-- === STEP 1: FETCH FROM TIER2 ===");
+            if (incremental)
+            {
+                sql.AppendLine("-- Saved Tier2 timestamp present: only rows changed in Tier2 since then");
+                sql.AppendLine(table.SqlTemplate
+                    .Replace("*", string.Join(", ", table.CopyableFields.Select(f => $"[{f}]")), StringComparison.OrdinalIgnoreCase)
+                    .Replace("@recordCount", recordCount.ToString())
+                    .Replace("@sysRowVersionFilter", "SysRowVersion >= @Threshold AND RecId >= @MinRecId", StringComparison.OrdinalIgnoreCase));
+                sql.AppendLine($"-- @Threshold = {TimestampHelper.ToHexString(table.StoredTier2Timestamp!)}   @MinRecId = 0");
+            }
+            else
+            {
+                sql.AppendLine(table.StrategyType == CopyStrategyType.Sql
+                    ? (HasRowVersionPlaceholder(table)
+                        ? $"-- {(hasSysRowVersion ? "No saved Tier2 timestamp yet" : "No SysRowVersion column")}: full strategy, @sysRowVersionFilter → (1 = 1)"
+                        : "-- No @sysRowVersionFilter placeholder: the full strategy is fetched on every run")
+                    : "-- RecId strategy: the top N rows are fetched on every run");
+                sql.AppendLine(table.FetchSql);
+            }
+            sql.AppendLine("-- 0 rows fetched → AxDB is not touched");
+            sql.AppendLine();
+
+            sql.AppendLine("-- === STEP 2: UPSERT (AxDB, single transaction) ===");
+            sql.AppendLine("-- Columns: the fetched ones minus rowversion/computed columns (sys.columns system_type_id 189 / is_computed)");
+            sql.AppendLine($"ALTER TABLE [{t}] DISABLE TRIGGER ALL");
+            sql.AppendLine(KeepModeSql.CreateTempTable(t, insertColumns));
+            sql.AppendLine($"-- SqlBulkCopy: all fetched rows → {KeepModeSql.TempTable}");
+            sql.AppendLine(KeepModeSql.IndexTempTable());
+            sql.AppendLine();
+            sql.AppendLine("-- Unique key conflicts - for every unique index of the AxDB table without RecId in its key");
+            sql.AppendLine("-- (read at runtime from sys.indexes / sys.index_columns; filtered indexes are not checked):");
+            sql.AppendLine(KeepModeSql.SelectConflicts(t, keyExample, KeepModeSql.ConflictSampleSize) + "   -- logged");
+            sql.AppendLine(KeepModeSql.DeleteConflicts(t, keyExample));
+            sql.AppendLine($"-- Repeated until a pass removes nothing (max {KeepModeSql.MaxConflictPasses}); removed rows are logged as");
+            sql.AppendLine("-- 'skipped: conflicts with local row' and are NOT copied");
+            sql.AppendLine();
+            sql.AppendLine(KeepModeSql.DeleteReplaced(t) + "   -- updated rows only");
+            sql.AppendLine(KeepModeSql.Insert(t, insertColumns));
+            sql.AppendLine(KeepModeSql.DropTempTable());
+            sql.AppendLine($"ALTER TABLE [{t}] ENABLE TRIGGER ALL             -- always re-enabled, also on error (rollback)");
+            sql.AppendLine();
+
+            AppendSequenceUpdate(sql, table, "-- === STEP 3: SEQUENCE UPDATE (same transaction, then COMMIT) ===");
+            sql.AppendLine();
+
+            sql.AppendLine("-- === STEP 4: SAVED VALUES ===");
+            if (hasSysRowVersion)
+            {
+                sql.AppendLine("-- Tier2 timestamp = MAX(SysRowVersion) of the fetched rows (unchanged when nothing was fetched)");
+                sql.AppendLine($"SELECT MAX(SysRowVersion) FROM [{t}]             -- AxDB timestamp (stored, not used by KEEP)");
+            }
+            else
+            {
+                sql.AppendLine("-- No SysRowVersion: nothing is saved, every run fetches the full strategy");
+            }
+            sql.AppendLine();
+
+            sql.AppendLine("-- === NOT DONE FOR -keep ===");
+            sql.AppendLine("-- No TRUNCATE, no smart TRUNCATE detection, no delta comparison, no DELETE outside the fetched RecIds;");
+            sql.AppendLine("-- rows deleted in Tier2 are not deleted in AxDB");
 
             return sql.ToString();
         }
