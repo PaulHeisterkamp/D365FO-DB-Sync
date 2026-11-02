@@ -418,6 +418,17 @@ Copies master data only, keeping item-related tables consistent. The **Init tran
   - Per table: own transaction, CDC disable/enable when `is_tracked_by_cdc`, `TRUNCATE TABLE`; errors 3729/4712 (indexed view / foreign key) fall back to `DELETE TOP (100000)` batches; other errors are printed and the cursor continues.
   - Verified: list mode on a real AxDB (8,581 transaction tables, 211 with rows); execute mode on a scratch DB (group rule, explicit, pattern, FK fallback, master data kept, empty/missing tables skipped).
 
+### Columnstore Guard (SQL Server bug 3624)
+
+On SQL Server 2019 (seen on 15.0.4500.2, RTM-CU32-GDR) **any SqlBulkCopy** (with or without TableLock, even 100 rows) into a table that has an enabled **nonclustered columnstore index** (type 6) **and** an enabled nonclustered rowstore index containing a **rowversion** column (`SYSROWVERSION`, `system_type_id` 189 — D365 creates these itself, named `dbo<TABLE><GUID>`) fails with assertion 3624 / error 17066 (`xmerror.cpp`, stack dump) and the session is killed. `INSERT … SELECT` is not affected (so KEEP's insert from `#keep` is safe). Affected D365 tables include GENERALJOURNALACCOUNTENTRY, GENERALJOURNALENTRY, CUSTINVOICEJOUR/TRANS, BUDGETTRANSACTIONHEADER/LINE, RETAILCUSTINVOICEJOURTABLE and the RETAILTRANSACTION* tables (transaction tables, so the transaction-less copy never hits it).
+
+- `StreamIndexSql.ListColumnstoreSql` lists the type-6 indexes with disabled flag, marker and `rowversion_index_enabled`. `AxDbDataService.DisableColumnstoreForBulkLoadAsync` runs right before **every** SqlBulkCopy into an AxDB table: enabled + `rowversion_index_enabled` → marker (`DBSyncTool_DisabledForLoad`, the same extended property as the STREAM indexes) + `ALTER INDEX … DISABLE`; disabled with marker → leftover, rebuilt too; disabled without marker → D365's own, untouched; stale marker on an enabled index → dropped. Rebuilding a columnstore index of 500,000 rows takes 2–10 s.
+- **In-memory route** (`InsertDataAsync`, standard / delta / optimized TRUNCATE branch) and **System route** (`InsertSystemTableDataAsync`): rebuilt with `RebuildIndexesAsync` after the bulk copy; after a failure/cancel `RebuildColumnstoreAfterFailureAsync` rebuilds on a fresh connection (the bug kills the session) and the triggers are re-enabled on a fresh connection when the old one is closed (`EnableTriggersAfterFailureAsync`). A failed rebuild after a successful load → `IndexRebuildException`.
+- **STREAM route**: called after `DisableNonclusteredIndexesAsync`, so normally a no-op (the SYSROWVERSION indexes are already disabled); it picks up columnstore leftovers of an interrupted in-memory load, rebuilt with the other indexes.
+- **INCREMENTAL route** (`CopyOrchestrator.ProcessTableOptimizedAsync`, its own SqlBulkCopy inside the table's transaction): `DisableColumnstoreInTransactionAsync` / `RebuildColumnstoreInTransactionAsync` run inside that transaction, so a rollback (including the one SQL Server does when the session dies) re-enables the index and drops the marker by itself.
+- **Get SQL** appends a `COLUMNSTORE GUARD` section for every route except KEEP (`SqlPreviewBuilder.ColumnstoreGuardNote`).
+- Verified on a real AxDB: Force truncate copy of the affected tables (previously error 3624) and an INCREMENTAL run inserting missing rows (previously error 3624) both succeed; no disabled columnstore index, marker or disabled trigger left.
+
 ### SQLDICTIONARY Caching
 
 Critical optimization in `Models/SqlDictionaryCache.cs`:

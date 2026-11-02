@@ -90,7 +90,7 @@ namespace DBSyncTool.Helpers
         public static string GenerateSqlForTable(TableInfo table, AppConfiguration config)
         {
             var route = GetPreviewRoute(table, out string reason);
-            return route switch
+            string preview = route switch
             {
                 PreviewRoute.System => GenerateSqlForSystemTable(table, reason, config),
                 PreviewRoute.Keep => GenerateSqlForKeepTable(table, reason, config),
@@ -98,6 +98,32 @@ namespace DBSyncTool.Helpers
                 PreviewRoute.Optimized => GenerateSqlForTableOptimized(table, reason, config),
                 _ => GenerateSqlForTableStandard(table, reason, config)
             };
+
+            // KEEP inserts with INSERT ... SELECT (not affected); every other route bulk-copies into the table
+            return route == PreviewRoute.Keep ? preview : preview + ColumnstoreGuardNote(table.TableName);
+        }
+
+        /// <summary>
+        /// Mirrors AxDbDataService.DisableColumnstoreForBulkLoadAsync / RebuildIndexesAsync, run
+        /// right before every SqlBulkCopy into the AxDB table.
+        /// </summary>
+        private static string ColumnstoreGuardNote(string t)
+        {
+            var sql = new System.Text.StringBuilder();
+            sql.AppendLine();
+            sql.AppendLine("-- === COLUMNSTORE GUARD (right before every SqlBulkCopy into the table above) ===");
+            sql.AppendLine("-- SQL Server bug: a bulk insert into a table with a nonclustered columnstore index AND an enabled");
+            sql.AppendLine("-- nonclustered index containing SYSROWVERSION fails with error 3624 and kills the session.");
+            sql.AppendLine(StreamIndexSql.ListColumnstoreSql.Replace("@Table", $"N'{StreamIndexSql.QualifiedTable(t)}'"));
+            sql.AppendLine("-- enabled + rowversion_index_enabled = 1 → marked, disabled for the bulk insert, rebuilt afterwards:");
+            sql.AppendLine(StreamIndexSql.AddMarker(t, "<columnstore index>", "<UTC time>"));
+            sql.AppendLine(StreamIndexSql.Disable(t, "<columnstore index>"));
+            sql.AppendLine("-- SqlBulkCopy ...  then in EVERY outcome (on a fresh connection after a failure):");
+            sql.AppendLine(StreamIndexSql.Rebuild(t, "<columnstore index>"));
+            sql.AppendLine(StreamIndexSql.DropMarker(t, "<columnstore index>") + "   -- only after a successful rebuild");
+            sql.AppendLine($"-- disabled WITH the marker {StreamIndexSql.MarkerName} (interrupted earlier run) → rebuilt as well;");
+            sql.AppendLine("-- disabled WITHOUT it (D365's own) → never touched; no such table → nothing is done");
+            return sql.ToString();
         }
 
         private static void AppendPreviewHeader(System.Text.StringBuilder sql, TableInfo table, string mode, string reason, AppConfiguration config, bool savedTimestampsUsed)

@@ -48,6 +48,32 @@ namespace DBSyncTool.Helpers
  WHERE i.object_id = OBJECT_ID(@Table) AND i.type = 2 AND i.is_hypothetical = 0
  ORDER BY i.index_id";
 
+        /// <summary>
+        /// Nonclustered columnstore indexes (type 6) of the table with: disabled flag, whether
+        /// they carry the DBSyncTool marker, and whether the table has an ENABLED nonclustered
+        /// rowstore index containing a rowversion column (SYSROWVERSION, system_type_id 189, key
+        /// or included). That combination makes SqlBulkCopy fail on SQL Server 2019 (assertion
+        /// 3624 / error 17066 in xmerror.cpp, the session is killed) - with or without TableLock,
+        /// with any row count; INSERT ... SELECT is not affected. D365 creates such tables itself
+        /// (e.g. GENERALJOURNALACCOUNTENTRY: I_7581COLUMNSTOREIDX + the dbo&lt;TABLE&gt;&lt;GUID&gt;
+        /// SYSROWVERSION indexes). Disabling the columnstore index for the load avoids it.
+        /// Parameter @Table = N'[dbo].[TABLE]'.
+        /// </summary>
+        public const string ListColumnstoreSql = @"SELECT i.name, i.is_disabled,
+       CASE WHEN EXISTS (SELECT 1 FROM sys.extended_properties ep
+                         WHERE ep.class = 7 AND ep.major_id = i.object_id AND ep.minor_id = i.index_id
+                           AND ep.name = N'" + MarkerName + @"')
+            THEN 1 ELSE 0 END AS dbsynctool_marked,
+       CASE WHEN EXISTS (SELECT 1 FROM sys.indexes r
+                           JOIN sys.index_columns ic ON ic.object_id = r.object_id AND ic.index_id = r.index_id
+                           JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+                         WHERE r.object_id = i.object_id AND r.type = 2 AND r.is_disabled = 0
+                           AND r.is_hypothetical = 0 AND c.system_type_id = 189)
+            THEN 1 ELSE 0 END AS rowversion_index_enabled
+  FROM sys.indexes i
+ WHERE i.object_id = OBJECT_ID(@Table) AND i.type = 6 AND i.is_hypothetical = 0
+ ORDER BY i.index_id";
+
         public static string QualifiedTable(string tableName) => $"[dbo].{Quote(tableName)}";
 
         public static string Quote(string name) => "[" + name.Replace("]", "]]") + "]";

@@ -227,6 +227,7 @@ Write-Host "Uploading $BackupFilePath..."
 - **Smart Field Mapping**: Automatically maps common fields between source and destination
 - **Parallel Execution**: Configurable parallel workers (1-50) for concurrent table processing
 - **Streaming for Large Tables**: A table with 1,000,000+ rows or 500+ MB to copy whose AxDB content is replaced by the fetched rows anyway (whole-table RecId copy without saved values, `-truncate` / Force truncate mode, System tables) is streamed from Tier2 straight into AxDB (TRUNCATE + SqlBulkCopy from a data reader) instead of being loaded into memory, so memory stays flat even with several parallel workers on multi-GB tables. Tier2 is read in short RecId chunks of 200,000 rows; when Azure drops the connection or kills the session, the copy waits and resumes after the last copied RecId (up to 5 times per table) instead of starting the table over. The AxDB table's nonclustered indexes (except those a foreign key needs) are disabled during the load and rebuilt afterwards — also after an error or Stop; a unique index that finds duplicates is reported with the SQL to fix it. Each index the tool disables is marked with the extended property `DBSyncTool_DisabledForLoad` until it is rebuilt, so an interrupted run is finished by the next one, while indexes that D365 itself keeps disabled (switched-off configuration keys) are never touched. Shown as `STREAM` in the Strategy column and in **Get SQL**. Like every bulk insert it is not transactional: a table that finally fails is left partly filled and is truncated again on retry
+- **Columnstore Guard**: works around a SQL Server 2019 bug: a bulk insert into a table that has a nonclustered columnstore index *and* a nonclustered index on `SYSROWVERSION` (D365 creates both, e.g. on GENERALJOURNALACCOUNTENTRY, CUSTINVOICETRANS, the RETAILTRANSACTION* tables) fails with error 3624 and a stack dump, and the session is killed. Before every bulk insert into such a table the columnstore index is disabled and rebuilt afterwards (a few seconds for 500,000 rows), in every outcome and with the same `DBSyncTool_DisabledForLoad` marker as the STREAM indexes; in INCREMENTAL mode inside the table's transaction, so a rollback re-enables it by itself
 - **Delta Comparison**: Smart comparison using RECVERSION + datetime fields to skip unchanged records
 - **Post-Transfer Actions**: Configurable chain of actions after successful sync:
   - **SQL Scripts**: Run custom SQL commands (e.g., cleanup, index rebuild)
@@ -363,6 +364,41 @@ Tables that copy a whole table gain the most. Tables with a sold-items filter (I
 - Check large copied tables for item relations; a sold-items filter typically cuts item tables to 2–25% of their rows.
 - Pause Windows Update for the duration of the run — in the first run it restarted SQL Server in the middle of the copy (the tool continued after Process Tables, but the interrupted tables had to be copied again).
 - After the first run, turn **Force truncate mode** off: tables with saved values then run incrementally (an incremental pass over the item tables took about 3 minutes instead of 10).
+
+### Real-world example: last 500,000 rows of every table
+
+Measured on 1 / 2 Nov 2026 with the classic setup of this tool: copy the newest 500,000 rows of every table (master data tables completely, plus the latest transactions) once with **Force truncate mode**, then keep the database current with incremental runs. Same VM as above (32 GB RAM, SQL Server 2019 Developer, `max server memory` 8 GB, `DELAYED_DURABILITY = FORCED` during the runs), 6 parallel workers, the sample **Tables to Exclude** list from Step 4, no Copy strategy lines.
+
+| Run | Settings | Tables | Rows | Duration |
+|---|---|---|---|---|
+| A: full copy | Records to copy 500,000 · Force truncate mode | 1,773, 0 failed | 183.7 million (Tier2: 2.46 TB in these tables) | **2 h 44 min** |
+| A2: incremental run right after A | Force truncate mode off | 1,771, 0 failed | 680,334 modified rows copied; 378 tables without changes, 272 incremental, 5 truncated; 33.2M fetched rows found unchanged by the delta comparison | **9 min 52 s** |
+| B: full copy like A, but indexes kept enabled during the STREAM load | (test build) | 1,771, 0 failed | 183.7 million | **7 h 34 min** |
+
+51 tables (24.1M rows, 1,032 nonclustered indexes) took the STREAM route. Summed per table (they run in parallel):
+
+| | A: indexes disabled, rebuilt afterwards | B: indexes enabled during the load |
+|---|---|---|
+| 51 STREAM tables | 133 min load + 102 min index rebuild = **235 min** | **1,668 min** (7.1×) |
+| the other 1,720 tables (in memory, unchanged code) | 747 min | 1,055 min (slower because the disk was busy with the STREAM tables) |
+
+| Table | Nonclustered indexes | A: load + rebuild | B: indexes enabled | Faster |
+|---|---:|---:|---:|---:|
+| SALESLINE | 83 | 28 min (8.4 + 19.8) | 4 h 19 min | 9.2× |
+| WHSWORKLINE | 51 | 8.2 min (1.5 + 6.7) | 2 h 26 min | 17.8× |
+| WHSWORKTABLE | 42 | 5.2 min (3.0 + 2.2) | 2 h 12 min | 25.1× |
+| SALESTABLE | 67 | 11.2 min (4.9 + 6.3) | 2 h 16 min | 12.1× |
+| CUSTTRANS | 23 | 6.0 min (3.7 + 2.3) | 70 min | 11.6× |
+| INVENTTABLE | 36 | 4.9 min (3.6 + 1.2) | 44 min | 9.0× |
+| INVENTTRANS | 30 | 4.3 min (1.1 + 3.2) | 30 min | 7.0× |
+| INVENTDIM | 29 | 4.3 min (0.6 + 3.7) | 26 min | 6.0× |
+| JOURNALERROR | 3 | 3.8 min (3.4 + 0.4) | 5.6 min | 1.5× |
+
+Even at 500,000 rows the index rebuild pays off: in 12 of the 51 tables the rebuild took longer than the load, but loading with the indexes enabled took 6–25× as long for index-heavy tables; tables with very few indexes gain least (1.1–1.5×).
+
+The resulting AxDB used 152.6 GB (117.1 GB in the copied tables, 34 GB in excluded tables that kept their old content); a compressed backup (`WITH COMPRESSION`) was 33.0 GB.
+
+The first attempt of run A stopped after 2 minutes with error 3624 on GENERALJOURNALACCOUNTENTRY — the SQL Server bug described under **Columnstore Guard**. Runs A, A2 and B were made with the 11 affected columnstore indexes disabled by hand; the guard now does this automatically (verified afterwards on the affected tables with Force truncate mode and in INCREMENTAL mode: 0 failed, each columnstore index rebuilt in 2–10 s).
 
 ## Notes
 

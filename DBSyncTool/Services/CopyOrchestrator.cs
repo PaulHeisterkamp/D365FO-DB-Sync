@@ -1364,8 +1364,11 @@ namespace DBSyncTool.Services
                                 filteredData.ImportRow(row);
                             }
 
-                            // Step 2.4: Bulk insert
+                            // Step 2.4: Bulk insert (columnstore indexes disabled around it where the
+                            // SQL Server bug would hit - in this transaction, so a rollback re-enables them)
                             var insertStopwatch = Stopwatch.StartNew();
+                            var columnstore = await _axDbService.DisableColumnstoreInTransactionAsync(
+                                table.TableName, connection, transaction, cancellationToken);
                             using (var bulkCopy = new SqlBulkCopy(connection, SqlBulkCopyOptions.Default, transaction))
                             {
                                 bulkCopy.DestinationTableName = table.TableName;
@@ -1379,6 +1382,7 @@ namespace DBSyncTool.Services
 
                                 await bulkCopy.WriteToServerAsync(filteredData, cancellationToken);
                             }
+                            await _axDbService.RebuildColumnstoreInTransactionAsync(table.TableName, columnstore, connection, transaction);
 
                             table.InsertTimeSeconds = (decimal)insertStopwatch.Elapsed.TotalSeconds;
                             table.RecordsFetched = filteredData.Rows.Count;

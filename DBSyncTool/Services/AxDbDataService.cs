@@ -123,6 +123,8 @@ namespace DBSyncTool.Services
             _logger($"[AxDB SQL] {disableTriggersSql}");
             await ExecuteNonQueryAsync(disableTriggersSql, connection, null, cancellationToken, TriggerCommandTimeoutSeconds);
 
+            var columnstoreToRebuild = new List<StreamIndex>();  // disabled for the bulk insert (SQL Server bug), rebuilt in every outcome
+            bool succeeded = false;
             try
             {
                 // Step 2: Truncate (falls back to DELETE if referenced by FK/view)
@@ -137,31 +139,47 @@ namespace DBSyncTool.Services
                 if (tableInfo.CachedData != null && tableInfo.CachedData.Rows.Count > 0)
                 {
                     _logger($"[AxDB] Bulk inserting {tableInfo.CachedData.Rows.Count} rows into {tableInfo.TableName}");
-                    using var bulkCopy = new SqlBulkCopy(connection);
-                    bulkCopy.DestinationTableName = tableInfo.TableName;
-                    bulkCopy.BatchSize = 10000;
-                    bulkCopy.BulkCopyTimeout = _connectionSettings.CommandTimeout;
+                    await DisableColumnstoreForBulkLoadAsync(tableInfo.TableName, connection, columnstoreToRebuild, cancellationToken);
 
-                    foreach (DataColumn column in tableInfo.CachedData.Columns)
+                    using (var bulkCopy = new SqlBulkCopy(connection))
                     {
-                        bulkCopy.ColumnMappings.Add(column.ColumnName, column.ColumnName);
-                    }
+                        bulkCopy.DestinationTableName = tableInfo.TableName;
+                        bulkCopy.BatchSize = 10000;
+                        bulkCopy.BulkCopyTimeout = _connectionSettings.CommandTimeout;
 
-                    await bulkCopy.WriteToServerAsync(tableInfo.CachedData, cancellationToken);
+                        foreach (DataColumn column in tableInfo.CachedData.Columns)
+                        {
+                            bulkCopy.ColumnMappings.Add(column.ColumnName, column.ColumnName);
+                        }
+
+                        await bulkCopy.WriteToServerAsync(tableInfo.CachedData, cancellationToken);
+                    }
                     rowCount = tableInfo.CachedData.Rows.Count;
+
+                    if (columnstoreToRebuild.Count > 0)
+                    {
+                        var rebuildFailures = await RebuildIndexesAsync(tableInfo.TableName, columnstoreToRebuild, connection, new StreamInsertResult());
+                        columnstoreToRebuild.Clear();
+                        if (rebuildFailures.Count > 0)
+                            throw new IndexRebuildException(string.Join(" | ", rebuildFailures), null);
+                    }
                 }
                 insertStopwatch.Stop();
                 tableInfo.InsertTimeSeconds = (decimal)insertStopwatch.Elapsed.TotalSeconds;
 
+                succeeded = true;
                 return rowCount;
             }
             finally
             {
-                // Always re-enable triggers, even on error/cancellation
+                if (!succeeded)
+                    await RebuildColumnstoreAfterFailureAsync(tableInfo.TableName, columnstoreToRebuild);
+
+                // Always re-enable triggers, even on error/cancellation (fresh connection when a
+                // fatal error closed the session)
                 try
                 {
-                    await ExecuteNonQueryAsync($"ALTER TABLE [{tableInfo.TableName}] ENABLE TRIGGER ALL", connection, null,
-                        CancellationToken.None, TriggerCommandTimeoutSeconds);
+                    await EnableTriggersAfterFailureAsync(tableInfo.TableName, connection);
                 }
                 catch
                 {
@@ -241,6 +259,9 @@ namespace DBSyncTool.Services
 
                     insertStopwatch.Start();
                     await DisableNonclusteredIndexesAsync(t, connection, toRebuild, result, cancellationToken);
+                    // Normally a no-op here (the SYSROWVERSION indexes were just disabled), but it also
+                    // rebuilds columnstore indexes left disabled by an interrupted in-memory load
+                    await DisableColumnstoreForBulkLoadAsync(t, connection, toRebuild, cancellationToken);
 
                     _logger($"[AxDB] Streaming bulk insert into {t} (TableLock, batch size 10,000, no transaction)");
                     using (var bulkCopy = new SqlBulkCopy(connection, SqlBulkCopyOptions.TableLock, null))
@@ -414,6 +435,160 @@ namespace DBSyncTool.Services
             result.DisableSeconds = sw.Elapsed.TotalSeconds;
             _logger($"[AxDB] {tableName}: disabled {result.IndexesDisabled} nonclustered index(es) for the load in {sw.Elapsed.TotalSeconds:F2}s " +
                     $"(marker {StreamIndexSql.MarkerName} + ALTER INDEX ... DISABLE; rebuilt after the load)");
+        }
+
+        /// <summary>
+        /// Workaround for a SQL Server 2019 bug: SqlBulkCopy into a table that has an enabled
+        /// nonclustered columnstore index AND an enabled nonclustered rowstore index containing a
+        /// rowversion column (D365's SYSROWVERSION indexes) fails with assertion 3624 and kills
+        /// the session. Called right before every bulk copy into an AxDB table; for such a table
+        /// each enabled columnstore index first gets the DBSyncTool marker, then ALTER INDEX ...
+        /// DISABLE (cheap: rebuilding a columnstore index of 500,000 rows takes seconds). Like the
+        /// STREAM route's rowstore indexes: disabled WITH the marker = leftover of an interrupted
+        /// run → rebuilt too; disabled WITHOUT it = D365's own → never touched; a stale marker on
+        /// an enabled index is dropped. <paramref name="toRebuild"/> is filled as it goes; the
+        /// caller rebuilds it in every outcome (<see cref="RebuildIndexesAsync"/>).
+        /// </summary>
+        private async Task DisableColumnstoreForBulkLoadAsync(string tableName, SqlConnection connection,
+            List<StreamIndex> toRebuild, CancellationToken cancellationToken, SqlTransaction? transaction = null)
+        {
+            var toDisable = new List<string>();
+            var staleMarkers = new List<string>();
+            var leftovers = new List<string>();
+
+            using (var command = new SqlCommand(StreamIndexSql.ListColumnstoreSql, connection, transaction))
+            {
+                command.Parameters.AddWithValue("@Table", StreamIndexSql.QualifiedTable(tableName));
+                command.CommandTimeout = TriggerCommandTimeoutSeconds;
+                using var reader = await command.ExecuteReaderAsync(cancellationToken);
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    string name = reader.GetString(0);
+                    bool disabled = reader.GetBoolean(1);
+                    bool marked = reader.GetInt32(2) == 1;
+                    bool rowversionIndexEnabled = reader.GetInt32(3) == 1;
+
+                    if (disabled && marked)
+                        leftovers.Add(name);
+                    else if (!disabled)
+                    {
+                        if (marked)
+                            staleMarkers.Add(name);
+                        if (rowversionIndexEnabled)
+                            toDisable.Add(name);
+                    }
+                    // disabled without the marker: disabled by D365 - never touched
+                }
+            }
+
+            if (leftovers.Count == 0 && toDisable.Count == 0 && staleMarkers.Count == 0)
+                return;
+
+            foreach (var name in leftovers)
+                toRebuild.Add(new StreamIndex(name, false, ""));
+            if (leftovers.Count > 0)
+                _logger($"[AxDB] {tableName}: columnstore index(es) still disabled by an interrupted DBSyncTool run (marker {StreamIndexSql.MarkerName}) - rebuilt after the load: {string.Join(", ", leftovers)}");
+
+            foreach (var name in staleMarkers)
+            {
+                _logger($"[AxDB] {tableName}: removing stale marker from enabled columnstore index {name}");
+                await ExecuteNonQueryAsync(StreamIndexSql.DropMarker(tableName, name), connection, transaction, cancellationToken, TriggerCommandTimeoutSeconds);
+            }
+
+            string stamp = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ");
+            foreach (var name in toDisable)
+            {
+                // Marker first: from here on the index is ours, even if the process dies
+                await ExecuteNonQueryAsync(StreamIndexSql.AddMarker(tableName, name, stamp), connection, transaction, cancellationToken, TriggerCommandTimeoutSeconds);
+                toRebuild.Add(new StreamIndex(name, false, ""));
+                await ExecuteNonQueryAsync(StreamIndexSql.Disable(tableName, name), connection, transaction, cancellationToken, TriggerCommandTimeoutSeconds);
+            }
+            if (toDisable.Count > 0)
+                _logger($"[AxDB] {tableName}: columnstore index(es) disabled for the bulk insert, rebuilt afterwards: {string.Join(", ", toDisable)} " +
+                        "(SQL Server bug: bulk insert into a table with a nonclustered columnstore index and a SYSROWVERSION index fails with error 3624)");
+        }
+
+        /// <summary>
+        /// <see cref="DisableColumnstoreForBulkLoadAsync"/> for the INCREMENTAL route, whose deletes
+        /// and bulk insert run in ONE transaction: marker and DISABLE are part of that transaction,
+        /// so a rollback (also the one SQL Server does when the bug kills the session) re-enables
+        /// the index by itself. Returns the indexes to pass to
+        /// <see cref="RebuildColumnstoreInTransactionAsync"/> after the bulk insert.
+        /// </summary>
+        public async Task<List<string>> DisableColumnstoreInTransactionAsync(string tableName, SqlConnection connection,
+            SqlTransaction transaction, CancellationToken cancellationToken)
+        {
+            var toRebuild = new List<StreamIndex>();
+            await DisableColumnstoreForBulkLoadAsync(tableName, connection, toRebuild, cancellationToken, transaction);
+            return toRebuild.Select(i => i.Name).ToList();
+        }
+
+        /// <summary>
+        /// Rebuilds the columnstore indexes of <see cref="DisableColumnstoreInTransactionAsync"/>
+        /// inside the same transaction and drops their markers. An error propagates - the caller
+        /// rolls back, which also undoes the DISABLE.
+        /// </summary>
+        public async Task RebuildColumnstoreInTransactionAsync(string tableName, IReadOnlyCollection<string> indexNames,
+            SqlConnection connection, SqlTransaction transaction)
+        {
+            if (indexNames.Count == 0)
+                return;
+
+            var sw = Stopwatch.StartNew();
+            foreach (var name in indexNames)
+            {
+                var indexSw = Stopwatch.StartNew();
+                string sql = StreamIndexSql.Rebuild(tableName, name);
+                await ExecuteNonQueryAsync(sql, connection, transaction, CancellationToken.None, StreamIndexSql.RebuildCommandTimeoutSeconds);
+                _logger($"[AxDB SQL] {sql}   ({indexSw.Elapsed.TotalSeconds:F2}s)");
+                await ExecuteNonQueryAsync(StreamIndexSql.DropMarker(tableName, name), connection, transaction, CancellationToken.None, TriggerCommandTimeoutSeconds);
+            }
+            _logger($"[AxDB] {tableName}: rebuilt {indexNames.Count} columnstore index(es) in {sw.Elapsed.TotalSeconds:F2}s");
+        }
+
+        /// <summary>
+        /// Rebuilds the columnstore indexes <see cref="DisableColumnstoreForBulkLoadAsync"/>
+        /// disabled, after a FAILED or cancelled in-memory bulk insert: on a fresh connection (the
+        /// bug kills the session; a cancelled bulk copy can leave the connection unusable), without
+        /// the cancellation token. Never throws - the original error stays what the table reports;
+        /// an index that still fails keeps its marker and is rebuilt by the next load of the table.
+        /// </summary>
+        private async Task RebuildColumnstoreAfterFailureAsync(string tableName, List<StreamIndex> toRebuild)
+        {
+            if (toRebuild.Count == 0)
+                return;
+
+            _logger($"[AxDB] {tableName}: rebuilding {toRebuild.Count} disabled columnstore index(es) after cancel/failure");
+            try
+            {
+                using var fresh = new SqlConnection(_connectionString);
+                await fresh.OpenAsync(CancellationToken.None);
+                await RebuildIndexesAsync(tableName, toRebuild, fresh, new StreamInsertResult());
+            }
+            catch (Exception ex)
+            {
+                _logger($"[AxDB] ERROR: {tableName}: columnstore index rebuild after the failure failed ({ex.Message}) - run: " +
+                        string.Join(" ; ", toRebuild.Select(i => StreamIndexSql.Rebuild(tableName, i.Name))));
+            }
+            toRebuild.Clear();
+        }
+
+        /// <summary>
+        /// ALTER TABLE ... ENABLE TRIGGER ALL without the cancellation token, on
+        /// <paramref name="connection"/> or - when a fatal error closed that session - on a fresh one.
+        /// </summary>
+        private async Task EnableTriggersAfterFailureAsync(string tableName, SqlConnection connection)
+        {
+            string sql = $"ALTER TABLE [{tableName}] ENABLE TRIGGER ALL";
+            if (connection.State == ConnectionState.Open)
+            {
+                await ExecuteNonQueryAsync(sql, connection, null, CancellationToken.None, TriggerCommandTimeoutSeconds);
+                return;
+            }
+
+            using var fresh = new SqlConnection(_connectionString);
+            await fresh.OpenAsync(CancellationToken.None);
+            await ExecuteNonQueryAsync(sql, fresh, null, CancellationToken.None, TriggerCommandTimeoutSeconds);
         }
 
         /// <summary>
@@ -736,6 +911,7 @@ namespace DBSyncTool.Services
             await connection.OpenAsync(cancellationToken);
 
             DataTable? filteredDataToDispose = null;  // Track filtered DataTable for disposal - declared outside try for catch block access
+            var columnstoreToRebuild = new List<StreamIndex>();  // disabled for the bulk insert (SQL Server bug), rebuilt in every outcome
 
             try
             {
@@ -890,6 +1066,8 @@ namespace DBSyncTool.Services
 
                 if (dataToInsert.Rows.Count > 0)
                 {
+                    await DisableColumnstoreForBulkLoadAsync(tableInfo.TableName, connection, columnstoreToRebuild, cancellationToken);
+
                     using (var bulkCopy = new SqlBulkCopy(connection))
                     {
                         bulkCopy.DestinationTableName = tableInfo.TableName;
@@ -903,6 +1081,14 @@ namespace DBSyncTool.Services
                         }
 
                         await bulkCopy.WriteToServerAsync(dataToInsert, cancellationToken);
+                    }
+
+                    if (columnstoreToRebuild.Count > 0)
+                    {
+                        var rebuildFailures = await RebuildIndexesAsync(tableInfo.TableName, columnstoreToRebuild, connection, new StreamInsertResult());
+                        columnstoreToRebuild.Clear();
+                        if (rebuildFailures.Count > 0)
+                            throw new IndexRebuildException(string.Join(" | ", rebuildFailures), null);
                     }
                 }
 
@@ -926,13 +1112,15 @@ namespace DBSyncTool.Services
             }
             catch
             {
+                await RebuildColumnstoreAfterFailureAsync(tableInfo.TableName, columnstoreToRebuild);
+
                 // Always try to re-enable triggers on error. Use CancellationToken.None so this
                 // still runs when the operation was cancelled, but keep a finite timeout so it
-                // cannot hang the worker.
+                // cannot hang the worker. A fatal error (e.g. the columnstore bug) closes the
+                // session - then a fresh connection is used.
                 try
                 {
-                    await ExecuteNonQueryAsync($"ALTER TABLE [{tableInfo.TableName}] ENABLE TRIGGER ALL", connection, null,
-                        CancellationToken.None, TriggerCommandTimeoutSeconds);
+                    await EnableTriggersAfterFailureAsync(tableInfo.TableName, connection);
                 }
                 catch
                 {
